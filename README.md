@@ -30,7 +30,16 @@ hadoop_fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
     spark._jsc.hadoopConfiguration()
 )
 
-def normalize(df, user_col, ts_col, channel):
+def normalize(df, user_col, channel):
+    if "start_time" in df.columns:
+        ts_col = "start_time"
+    elif "HKT" in df.columns:
+        ts_col = "HKT"
+    elif "date" in df.columns:
+        ts_col = "date"
+    else:
+        return spark.createDataFrame([], "customer_id STRING, event_ts TIMESTAMP, channel STRING")
+
     return (
         df.select(
             col(user_col).alias("customer_id"),
@@ -127,24 +136,25 @@ for part, mnth in months.items():
         (part, "Live Chat", uniq_chat / total_clients * 100)
     ]
 
-    stacy_post = [normalize(df, "user_id", "start_time", "Stacy")
-                  for k, df in stacy_dfs.items() if "post" in k]
+    stacy_post = [normalize(df, "user_id", "Stacy") for k, df in stacy_dfs.items() if "post" in k]
 
     ivr_post = [
-        normalize(df.filter(col("ONE_FA").isin(post_login_values)), "REL_ID", "start_time", "IVR")
+        normalize(df.filter(col("ONE_FA").isin(post_login_values)), "REL_ID", "IVR")
         for df in ivr_dfs
     ]
 
     call_post = normalize(
         df_call.filter(col("Verification_Status") == "Pass"),
-        "Customer_No_(CTI)", "start_time", "Call"
+        "Customer_No_(CTI)", "Call"
     ) if df_call else None
 
-    chat_post = normalize(
-        df_chat.filter(col("Pre/Post") == "Postlogin")
-               .withColumn("event_ts", concat_ws(" ", col("date"), col("time"))),
-        "REL ID", "event_ts", "Live Chat"
-    ) if df_chat else None
+    chat_post = None
+    if df_chat:
+        df_chat = df_chat.withColumn("HKT", concat_ws(" ", col("date"), col("time")))
+        chat_post = normalize(
+            df_chat.filter(col("Pre/Post") == "Postlogin"),
+            "REL ID", "Live Chat"
+        )
 
     union_list = stacy_post + ivr_post
     if call_post:
