@@ -7,6 +7,7 @@ from pyspark.sql.window import Window
 from functools import reduce
 
 spark = SparkSession.builder.appName("CallCentreFullAnalytics").getOrCreate()
+spark.conf.set("spark.sql.session.timeZone", "Asia/Hong_Kong")
 
 months = {
     "202501": "jan", "202502": "feb", "202503": "mar",
@@ -36,31 +37,48 @@ def resolve_user_col(df):
             return c
     return None
 
-def resolve_timestamp_col(df):
+def resolve_timestamp_expr(df):
+    exprs = []
+
     if "start_time" in df.columns:
-        return to_timestamp(col("start_time"), "yyyy-MM-dd HH:mm:ss")
+        exprs += [
+            to_timestamp(col("start_time"), "yyyy-MM-dd HH:mm:ss"),
+            to_timestamp(col("start_time"), "yyyy-MM-dd'T'HH:mm:ss"),
+            to_timestamp(col("start_time"), "yyyy/MM/dd HH:mm:ss")
+        ]
+
     if "HKT" in df.columns:
-        return coalesce(
-            to_timestamp(col("HKT"), "yyyy-MM-dd HH:mm:ss"),
+        exprs += [
+            to_timestamp(col("HKT"), "yyyyMMdd HH:mm:ss"),
             to_timestamp(col("HKT"), "yyyyMMdd HHmmss"),
-            to_timestamp(col("HKT"), "yyyy-MM-dd-HH.mm.ss")
-        )
-    if "date" in df.columns:
-        return to_timestamp(col("date"), "yyyy-MM-dd")
+            to_timestamp(col("HKT"), "yyyy-MM-dd HH:mm:ss"),
+            to_timestamp(col("HKT"), "dd/MM/yyyy HH:mm:ss")
+        ]
+
     if "Date7" in df.columns and "StartTime" in df.columns:
-        return to_timestamp(concat_ws(" ", col("Date7"), col("StartTime")), "yyyyMMdd HHmmss")
-    return None
+        exprs += [
+            to_timestamp(concat_ws(" ", col("Date7"), col("StartTime")), "yyyyMMdd HHmmss"),
+            to_timestamp(concat_ws(" ", col("Date7"), col("StartTime")), "yyyyMMdd HH:mm:ss")
+        ]
+
+    if "date" in df.columns and "time" in df.columns:
+        exprs += [
+            to_timestamp(concat_ws(" ", col("date"), col("time")), "yyyy-MM-dd HH:mm:ss"),
+            to_timestamp(concat_ws(" ", col("date"), col("time")), "dd/MM/yyyy HH:mm:ss")
+        ]
+
+    return coalesce(*exprs) if exprs else None
 
 def normalize(df, channel):
     user_col = resolve_user_col(df)
-    ts_expr = resolve_timestamp_col(df)
+    ts_expr = resolve_timestamp_expr(df)
 
     if user_col is None or ts_expr is None:
         return spark.createDataFrame([], "customer_id STRING, event_ts TIMESTAMP, channel STRING")
 
     return (
         df.select(
-            col(user_col).alias("customer_id"),
+            col(user_col).cast("string").alias("customer_id"),
             ts_expr.alias("event_ts")
         )
         .withColumn("channel", lit(channel))
@@ -111,10 +129,14 @@ for part, mnth in months.items():
         (part, "Live Chat", df_chat.filter(col("Pre/Post") == "Postlogin").count() if df_chat else 0)
     ]
 
+    uniq_stacy_ids = [
+        df.select(resolve_user_col(df)).alias("cid")
+        for a, df in stacy_dfs if a == "post" and resolve_user_col(df) is not None
+    ]
+
     uniq_stacy = (
-        reduce(lambda a, b: a.unionByName(b),
-               [df.select(resolve_user_col(df)).alias("cid") for a, df in stacy_dfs if a == "post"])
-        .distinct().count() if stacy_dfs else 0
+        reduce(lambda a, b: a.unionByName(b), uniq_stacy_ids).distinct().count()
+        if uniq_stacy_ids else 0
     )
 
     uniq_ivr = (
@@ -156,22 +178,6 @@ for part, mnth in months.items():
             reduce(lambda a, b: a.unionByName(b), norm_dfs).withColumn("month", lit(part))
         )
 
-overview_df = spark.createDataFrame(
-    overview_data, ["month", "channel", "volume"]
-).withColumn("volume_fmt", format_number("volume", 0))
-
-overview_post_df = spark.createDataFrame(
-    overview_post_data, ["month", "channel", "volume"]
-).withColumn("volume_fmt", format_number("volume", 0))
-
-unique_df = spark.createDataFrame(
-    unique_channel_data, ["month", "channel", "volume"]
-).withColumn("volume_fmt", format_number("volume", 0))
-
-ratio_df = spark.createDataFrame(
-    contact_ratio_data, ["month", "channel", "ratio"]
-).withColumn("ratio_fmt", format_number("ratio", 2))
-
 combined_df = reduce(lambda a, b: a.unionByName(b), all_months_df)
 
 w = Window.partitionBy("month", "customer_id").orderBy("event_ts")
@@ -202,10 +208,6 @@ second_channel = flow_df.join(
 ).filter(col("contact_order") == 2) \
  .groupBy("month", "channel").count()
 
-overview_df.show()
-overview_post_df.show()
-unique_df.show()
-ratio_df.show()
 first_contact.show()
 followup_dist.show()
 second_channel.show()
