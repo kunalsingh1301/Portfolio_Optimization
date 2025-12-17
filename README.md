@@ -30,7 +30,23 @@ hadoop_fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
     spark._jsc.hadoopConfiguration()
 )
 
+def resolve_user_col(df, preferred):
+    if preferred in df.columns:
+        return preferred
+    if "customer_id" in df.columns:
+        return "customer_id"
+    if "user_id" in df.columns:
+        return "user_id"
+    return None
+
 def normalize(df, user_col, channel):
+    resolved_user_col = resolve_user_col(df, user_col)
+
+    if resolved_user_col is None:
+        return spark.createDataFrame(
+            [], "customer_id STRING, event_ts TIMESTAMP, channel STRING"
+        )
+
     if "start_time" in df.columns:
         ts_col = "start_time"
     elif "HKT" in df.columns:
@@ -38,11 +54,13 @@ def normalize(df, user_col, channel):
     elif "date" in df.columns:
         ts_col = "date"
     else:
-        return spark.createDataFrame([], "customer_id STRING, event_ts TIMESTAMP, channel STRING")
+        return spark.createDataFrame(
+            [], "customer_id STRING, event_ts TIMESTAMP, channel STRING"
+        )
 
     return (
         df.select(
-            col(user_col).alias("customer_id"),
+            col(resolved_user_col).alias("customer_id"),
             to_timestamp(col(ts_col)).alias("event_ts")
         )
         .withColumn("channel", lit(channel))
@@ -62,24 +80,26 @@ for part, mnth in months.items():
         for auth in stacy_auth:
             path = f"/user/2030435/CallCentreAnalystics/{mnth}_stacy_{cnt}_{auth}login.csv"
             if hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(path)):
-                stacy_dfs[f"{cnt}_{auth}"] = spark.read.csv(path, header=True, inferSchema=True)
+                stacy_dfs[f"{cnt}_{auth}"] = spark.read.csv(
+                    path, header=True, inferSchema=True
+                )
 
     ivr_dfs = []
     for i in range(1, 5):
         path = f"/user/2030435/CallCentreAnalystics/{mnth}_ivr{i}.csv"
         if hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(path)):
-            ivr_dfs.append(spark.read.csv(path, header=True, inferSchema=True))
+            ivr_dfs.append(
+                spark.read.csv(path, header=True, inferSchema=True)
+            )
 
     call_path = f"/user/2030435/CallCentreAnalystics/{mnth}_call.csv"
     chat_path = f"/user/2030435/CallCentreAnalystics/{mnth}_chat.csv"
 
-    df_call = spark.read.csv(call_path, header=True, inferSchema=True) if hadoop_fs.exists(
-        spark._jvm.org.apache.hadoop.fs.Path(call_path)
-    ) else None
+    df_call = spark.read.csv(call_path, header=True, inferSchema=True) \
+        if hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(call_path)) else None
 
-    df_chat = spark.read.csv(chat_path, header=True, inferSchema=True) if hadoop_fs.exists(
-        spark._jvm.org.apache.hadoop.fs.Path(chat_path)
-    ) else None
+    df_chat = spark.read.csv(chat_path, header=True, inferSchema=True) \
+        if hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(chat_path)) else None
 
     count_stacy = sum(df.count() for df in stacy_dfs.values())
     count_ivr = sum(df.count() for df in ivr_dfs)
@@ -94,9 +114,17 @@ for part, mnth in months.items():
     ]
 
     count_stacy_post = sum(df.count() for k, df in stacy_dfs.items() if "post" in k)
-    count_ivr_post = sum(df.filter(col("ONE_FA").isin(post_login_values)).count() for df in ivr_dfs)
-    count_call_post = df_call.filter(col("Verification Status") == "Pass").count() if df_call else 0
-    count_chat_post = df_chat.filter(col("Pre/Post") == "Postlogin").count() if df_chat else 0
+    count_ivr_post = sum(
+        df.filter(col("ONE_FA").isin(post_login_values)).count() for df in ivr_dfs
+    )
+    count_call_post = (
+        df_call.filter(col("Verification Status") == "Pass").count()
+        if df_call else 0
+    )
+    count_chat_post = (
+        df_chat.filter(col("Pre/Post") == "Postlogin").count()
+        if df_chat else 0
+    )
 
     overview_post_data += [
         (part, "Stacy", count_stacy_post),
@@ -107,7 +135,8 @@ for part, mnth in months.items():
 
     uniq_stacy = (
         reduce(lambda a, b: a.union(b),
-               [df.select(col("user_id").alias("cid")) for k, df in stacy_dfs.items() if "post" in k])
+               [df.select(resolve_user_col(df, "user_id")).alias("cid")
+                for k, df in stacy_dfs.items() if "post" in k])
         .distinct().count() if count_stacy_post > 0 else 0
     )
 
@@ -117,8 +146,15 @@ for part, mnth in months.items():
         .distinct().count() if count_ivr > 0 else 0
     )
 
-    uniq_call = df_call.select(col("Customer No (CTI)").alias("cid")).distinct().count() if df_call else 0
-    uniq_chat = df_chat.select(col("REL ID").alias("cid")).distinct().count() if df_chat else 0
+    uniq_call = (
+        df_call.select(col("Customer No (CTI)").alias("cid")).distinct().count()
+        if df_call else 0
+    )
+
+    uniq_chat = (
+        df_chat.select(col("REL ID").alias("cid")).distinct().count()
+        if df_chat else 0
+    )
 
     unique_channel_data += [
         (part, "Stacy", uniq_stacy),
@@ -136,21 +172,31 @@ for part, mnth in months.items():
         (part, "Live Chat", uniq_chat / total_clients * 100)
     ]
 
-    stacy_post = [normalize(df, "user_id", "Stacy") for k, df in stacy_dfs.items() if "post" in k]
+    stacy_post = [
+        normalize(df, "user_id", "Stacy")
+        for k, df in stacy_dfs.items() if "post" in k
+    ]
 
     ivr_post = [
-        normalize(df.filter(col("ONE_FA").isin(post_login_values)), "REL_ID", "IVR")
+        normalize(
+            df.filter(col("ONE_FA").isin(post_login_values)),
+            "REL_ID", "IVR"
+        )
         for df in ivr_dfs
     ]
 
-    call_post = normalize(
-        df_call.filter(col("Verification Status") == "Pass"),
-        "Customer No (CTI)", "Call"
-    ) if df_call else None
+    call_post = (
+        normalize(
+            df_call.filter(col("Verification Status") == "Pass"),
+            "Customer No (CTI)", "Call"
+        ) if df_call else None
+    )
 
     chat_post = None
     if df_chat:
-        df_chat = df_chat.withColumn("HKT", concat_ws(" ", col("Date7"), col("StartTime")))
+        df_chat = df_chat.withColumn(
+            "HKT", concat_ws(" ", col("Date7"), col("StartTime"))
+        )
         chat_post = normalize(
             df_chat.filter(col("Pre/Post") == "Postlogin"),
             "REL ID", "Live Chat"
@@ -190,8 +236,10 @@ w = Window.partitionBy("month", "customer_id").orderBy("event_ts")
 
 flow_df = combined_df.withColumn("contact_order", row_number().over(w))
 
-first_contact = flow_df.filter(col("contact_order") == 1) \
+first_contact = (
+    flow_df.filter(col("contact_order") == 1)
     .groupBy("month", "channel").count()
+)
 
 stacy_start = flow_df.filter(
     (col("contact_order") == 1) & (col("channel") == "Stacy")
@@ -199,27 +247,38 @@ stacy_start = flow_df.filter(
 
 stacy_cases = stacy_start.groupBy("month").count()
 
-stacy_customers = stacy_start.select("month", "customer_id").distinct() \
+stacy_customers = (
+    stacy_start.select("month", "customer_id").distinct()
     .groupBy("month").count()
+)
 
-followups = flow_df.join(
-    stacy_start.select("month", "customer_id"),
-    ["month", "customer_id"]
-).filter(col("contact_order") > 1) \
- .groupBy("month", "customer_id").count()
+followups = (
+    flow_df.join(
+        stacy_start.select("month", "customer_id"),
+        ["month", "customer_id"]
+    )
+    .filter(col("contact_order") > 1)
+    .groupBy("month", "customer_id").count()
+)
 
-followup_dist = followups.withColumn(
-    "bucket",
-    when(col("count") == 1, "1")
-    .when(col("count") == 2, "2")
-    .when(col("count") >= 3, "3+")
-).groupBy("month", "bucket").count()
+followup_dist = (
+    followups.withColumn(
+        "bucket",
+        when(col("count") == 1, "1")
+        .when(col("count") == 2, "2")
+        .when(col("count") >= 3, "3+")
+    )
+    .groupBy("month", "bucket").count()
+)
 
-second_channel = flow_df.join(
-    stacy_start.select("month", "customer_id"),
-    ["month", "customer_id"]
-).filter(col("contact_order") == 2) \
- .groupBy("month", "channel").count()
+second_channel = (
+    flow_df.join(
+        stacy_start.select("month", "customer_id"),
+        ["month", "customer_id"]
+    )
+    .filter(col("contact_order") == 2)
+    .groupBy("month", "channel").count()
+)
 
 overview_df.show()
 overview_post_df.show()
