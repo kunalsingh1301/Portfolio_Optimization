@@ -95,7 +95,7 @@ for part, mnth in months.items():
 
     count_stacy_post = sum(df.count() for k, df in stacy_dfs.items() if "post" in k)
     count_ivr_post = sum(df.filter(col("ONE_FA").isin(post_login_values)).count() for df in ivr_dfs)
-    count_call_post = df_call.filter(col("Verification_Status") == "Pass").count() if df_call else 0
+    count_call_post = df_call.filter(col("Verification Status") == "Pass").count() if df_call else 0
     count_chat_post = df_chat.filter(col("Pre/Post") == "Postlogin").count() if df_chat else 0
 
     overview_post_data += [
@@ -117,7 +117,7 @@ for part, mnth in months.items():
         .distinct().count() if count_ivr > 0 else 0
     )
 
-    uniq_call = df_call.select(col("Customer_No_(CTI)").alias("cid")).distinct().count() if df_call else 0
+    uniq_call = df_call.select(col("Customer No (CTI)").alias("cid")).distinct().count() if df_call else 0
     uniq_chat = df_chat.select(col("REL ID").alias("cid")).distinct().count() if df_chat else 0
 
     unique_channel_data += [
@@ -144,13 +144,13 @@ for part, mnth in months.items():
     ]
 
     call_post = normalize(
-        df_call.filter(col("Verification_Status") == "Pass"),
-        "Customer_No_(CTI)", "Call"
+        df_call.filter(col("Verification Status") == "Pass"),
+        "Customer No (CTI)", "Call"
     ) if df_call else None
 
     chat_post = None
     if df_chat:
-        df_chat = df_chat.withColumn("HKT", concat_ws(" ", col("date"), col("time")))
+        df_chat = df_chat.withColumn("HKT", concat_ws(" ", col("Date7"), col("StartTime")))
         chat_post = normalize(
             df_chat.filter(col("Pre/Post") == "Postlogin"),
             "REL ID", "Live Chat"
