@@ -1,12 +1,12 @@
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col, lit, to_timestamp, concat_ws, row_number,
-    format_number, when
+    format_number
 )
 from pyspark.sql.window import Window
 from functools import reduce
 
-spark = SparkSession.builder.appName("CallCentreFullAnalytics").getOrCreate()
+spark = SparkSession.builder.appName("CallCentreFinal").getOrCreate()
 spark.conf.set("spark.sql.session.timeZone", "Asia/Hong_Kong")
 
 # =========================
@@ -33,22 +33,25 @@ hadoop_fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
 )
 
 # =========================
-# NORMALIZER WITH DEBUG
+# UNIVERSAL NORMALIZER
 # =========================
-def normalize(df, channel, user_col, ts_type):
+def normalize(df, channel, user_col):
     print(f"\n--- NORMALIZING {channel} ---")
-    print("Input rows:", df.count())
     print("Columns:", df.columns)
+    print("Rows before:", df.count())
 
-    if ts_type == "single":
+    if "HKT" in df.columns:
+        ts_expr = to_timestamp(col("HKT"), "dd-MM-yyyy HH:mm")
+    elif "start_time" in df.columns:
         ts_expr = to_timestamp(col("start_time"), "dd-MM-yyyy HH:mm")
-    elif ts_type == "chat":
+    elif set(["date", "time"]).issubset(df.columns):
         ts_expr = to_timestamp(
             concat_ws(" ", col("date"), col("time")),
             "dd-MM-yyyy HH:mm:ss"
         )
     else:
-        raise Exception("Invalid ts_type")
+        print("❌ No timestamp column found")
+        return None
 
     parsed = df.select(
         col(user_col).cast("string").alias("customer_id"),
@@ -67,13 +70,13 @@ def normalize(df, channel, user_col, ts_type):
     return valid.withColumn("channel", lit(channel))
 
 # =========================
-# RESULT HOLDERS
+# HOLDERS
 # =========================
 overview = []
 overview_post = []
 unique_data = []
 ratio_data = []
-all_months_flow = []
+all_flow = []
 
 # =========================
 # MAIN LOOP
@@ -91,7 +94,7 @@ for part, mnth in months.items():
             if hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(path)):
                 df = spark.read.csv(path, header=True)
                 user_col = "user_id" if "user_id" in df.columns else "customer_id"
-                stacy_dfs.append((auth, df))
+                stacy_dfs.append((auth, df, user_col))
 
     # ===== IVR =====
     for i in range(1, 5):
@@ -112,121 +115,51 @@ for part, mnth in months.items():
     ) else None
 
     # =========================
-    # COUNTS
-    # =========================
-    count_stacy = sum(df.count() for _, df in stacy_dfs)
-    count_ivr = sum(df.count() for df in ivr_dfs)
-    count_call = df_call.count() if df_call else 0
-    count_chat = df_chat.count() if df_chat else 0
-
-    overview += [
-        (part, "Stacy", count_stacy),
-        (part, "IVR", count_ivr),
-        (part, "Call", count_call),
-        (part, "Live Chat", count_chat)
-    ]
-
-    # =========================
-    # POST LOGIN COUNTS
-    # =========================
-    count_stacy_post = sum(df.count() for a, df in stacy_dfs if a == "post")
-    count_ivr_post = sum(df.filter(col("ONE_FA").isin(post_login_values)).count() for df in ivr_dfs)
-    count_call_post = df_call.filter(col("Verification Status") == "Pass").count() if df_call else 0
-    count_chat_post = df_chat.filter(col("Pre/Post") == "Postlogin").count() if df_chat else 0
-
-    overview_post += [
-        (part, "Stacy", count_stacy_post),
-        (part, "IVR", count_ivr_post),
-        (part, "Call", count_call_post),
-        (part, "Live Chat", count_chat_post)
-    ]
-
-    # =========================
-    # UNIQUE CUSTOMERS
-    # =========================
-    uniq_stacy = reduce(
-        lambda a, b: a.union(b),
-        [df.select(user_col).cast("string") for a, df in stacy_dfs if a == "post"]
-    ).distinct().count() if count_stacy_post > 0 else 0
-
-    uniq_ivr = reduce(
-        lambda a, b: a.union(b),
-        [df.select("REL_ID").cast("string") for df in ivr_dfs]
-    ).distinct().count() if count_ivr > 0 else 0
-
-    uniq_call = df_call.select(col("Customer No (CTI)").cast("string")).distinct().count() if df_call else 0
-    uniq_chat = df_chat.select(col("REL ID").cast("string")).distinct().count() if df_chat else 0
-
-    unique_data += [
-        (part, "Stacy", uniq_stacy),
-        (part, "IVR", uniq_ivr),
-        (part, "Call", uniq_call),
-        (part, "Live Chat", uniq_chat)
-    ]
-
-    total_clients = total_HK_clients[part]
-
-    ratio_data += [
-        (part, "Stacy", uniq_stacy / total_clients * 100),
-        (part, "IVR", uniq_ivr / total_clients * 100),
-        (part, "Call", uniq_call / total_clients * 100),
-        (part, "Live Chat", uniq_chat / total_clients * 100)
-    ]
-
-    # =========================
-    # FLOW DATA (POST LOGIN ONLY)
+    # FLOW (POST LOGIN ONLY)
     # =========================
     flow_parts = []
 
-    for auth, df in stacy_dfs:
+    for auth, df, user_col in stacy_dfs:
         if auth == "post":
-            user_col = "user_id" if "user_id" in df.columns else "customer_id"
-            flow_parts.append(normalize(df, "Stacy", user_col, "single"))
+            norm = normalize(df, "Stacy", user_col)
+            if norm:
+                flow_parts.append(norm)
 
     for df in ivr_dfs:
-        flow_parts.append(
-            normalize(
-                df.filter(col("ONE_FA").isin(post_login_values)),
-                "IVR", "REL_ID", "single"
-            )
+        norm = normalize(
+            df.filter(col("ONE_FA").isin(post_login_values)),
+            "IVR", "REL_ID"
         )
+        if norm:
+            flow_parts.append(norm)
 
     if df_call:
-        flow_parts.append(
-            normalize(
-                df_call.filter(col("Verification Status") == "Pass"),
-                "Call", "Customer No (CTI)", "single"
-            )
+        norm = normalize(
+            df_call.filter(col("Verification Status") == "Pass"),
+            "Call", "Customer No (CTI)"
         )
+        if norm:
+            flow_parts.append(norm)
 
     if df_chat:
-        df_chat = df_chat.filter(col("Pre/Post") == "Postlogin")
-        flow_parts.append(
-            normalize(df_chat, "Live Chat", "REL ID", "chat")
+        norm = normalize(
+            df_chat.filter(col("Pre/Post") == "Postlogin"),
+            "Live Chat", "REL ID"
         )
+        if norm:
+            flow_parts.append(norm)
 
     if flow_parts:
-        all_months_flow.append(
+        all_flow.append(
             reduce(lambda a, b: a.unionByName(b), flow_parts)
             .withColumn("month", lit(part))
         )
 
 # =========================
-# FINAL DATAFRAMES
+# FLOW ANALYSIS
 # =========================
-overview_df = spark.createDataFrame(overview, ["month", "channel", "volume"]) \
-    .withColumn("volume_fmt", format_number("volume", 0))
-
-overview_post_df = spark.createDataFrame(overview_post, ["month", "channel", "volume"]) \
-    .withColumn("volume_fmt", format_number("volume", 0))
-
-unique_df = spark.createDataFrame(unique_data, ["month", "channel", "volume"]) \
-    .withColumn("volume_fmt", format_number("volume", 0))
-
-ratio_df = spark.createDataFrame(ratio_data, ["month", "channel", "ratio"]) \
-    .withColumn("ratio_fmt", format_number("ratio", 2))
-
-combined_flow = reduce(lambda a, b: a.unionByName(b), all_months_flow)
+combined_flow = reduce(lambda a, b: a.unionByName(b), all_flow)
+print("\nFINAL FLOW COUNT:", combined_flow.count())
 
 w = Window.partitionBy("month", "customer_id").orderBy("event_ts")
 flow_df = combined_flow.withColumn("contact_order", row_number().over(w))
@@ -234,27 +167,16 @@ flow_df = combined_flow.withColumn("contact_order", row_number().over(w))
 first_contact = flow_df.filter(col("contact_order") == 1) \
     .groupBy("month", "channel").count()
 
-stacy_start = flow_df.filter(
-    (col("contact_order") == 1) & (col("channel") == "Stacy")
-)
-
 second_channel = flow_df.filter(col("contact_order") == 2) \
     .groupBy("month", "channel").count()
 
-followups = flow_df.join(
-    stacy_start.select("month", "customer_id"),
-    ["month", "customer_id"]
-).filter(col("contact_order") > 1)
-
-followup_dist = followups.groupBy("month", "customer_id").count()
+followups = flow_df.filter(col("contact_order") > 1) \
+    .groupBy("month", "customer_id").count()
 
 # =========================
-# SHOW RESULTS
+# SHOW
 # =========================
-overview_df.show()
-overview_post_df.show()
-unique_df.show()
-ratio_df.show()
+combined_flow.show(10, False)
 first_contact.show()
 second_channel.show()
-followup_dist.show()
+followups.show()
