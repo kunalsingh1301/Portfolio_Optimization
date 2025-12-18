@@ -1,182 +1,180 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import (
-    col, lit, to_timestamp, concat_ws, row_number,
-    format_number
-)
+from pyspark.sql.functions import col, substring, lit, count, row_number
 from pyspark.sql.window import Window
-from functools import reduce
+from pyspark.sql.types import StructType, StructField, StringType
 
-spark = SparkSession.builder.appName("CallCentreFinal").getOrCreate()
-spark.conf.set("spark.sql.session.timeZone", "Asia/Hong_Kong")
+# Define month and its abbreviation
+mnth = 'jan'
+part = '202501'
 
-# =========================
-# MONTHS & CLIENT BASE
-# =========================
-months = {
-    "202501": "jan", "202502": "feb", "202503": "mar",
-    "202504": "apr", "202505": "may", "202506": "jun",
-    "202507": "jul", "202508": "aug", "202509": "sep",
-    "202510": "oct", "202511": "nov"
-}
-
-total_HK_clients = {
-    "202501": 1748757, "202502": 1749000, "202503": 1750000,
-    "202504": 1751000, "202505": 1752000, "202506": 1753000,
-    "202507": 1754000, "202508": 1755000, "202509": 1756000,
-    "202510": 1757000, "202511": 1758000
-}
-
+# Define channels and file paths
+stacy_cnt = ['en', 'zh']
+stacy_auth = ['post']
 post_login_values = ["OTP|S", "VB|S", "TPIN|S"]
 
-hadoop_fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
-    spark._jsc.hadoopConfiguration()
-)
+# Define schemas
+schema = StructType([
+    StructField("user_id", StringType(), True),
+    StructField("date", StringType(), True),
+    StructField("time", StringType(), True),
+    StructField("channel_name", StringType(), True),
+])
 
-# =========================
-# UNIVERSAL NORMALIZER
-# =========================
-def normalize(df, channel, user_col):
-    print(f"\n--- NORMALIZING {channel} ---")
-    print("Columns:", df.columns)
-    print("Rows before:", df.count())
+# Initialize Spark session
+spark = SparkSession.builder.appName("CallCentreAnalytics").getOrCreate()
 
-    if "HKT" in df.columns:
-        ts_expr = to_timestamp(col("HKT"), "dd-MM-yyyy HH:mm")
-    elif "start_time" in df.columns:
-        ts_expr = to_timestamp(col("start_time"), "dd-MM-yyyy HH:mm")
-    elif set(["date", "time"]).issubset(df.columns):
-        ts_expr = to_timestamp(
-            concat_ws(" ", col("date"), col("time")),
-            "dd-MM-yyyy HH:mm:ss"
-        )
-    else:
-        print("❌ No timestamp column found")
-        return None
+# Initialize Hadoop file system
+hadoop_fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
 
-    parsed = df.select(
-        col(user_col).cast("string").alias("customer_id"),
-        ts_expr.alias("event_ts")
-    )
+# Construct file paths
+file_paths_stacy = {}
+for cnt in stacy_cnt:
+    for auth in stacy_auth:
+        file_key = f'{mnth}_stacy_{cnt}_{auth}'
+        file_path = f"/user/2030435/CallCentreAnalystics/{file_key}login.csv"
+        file_paths_stacy[file_key] = file_path
 
-    parsed.show(5, False)
+ivr_file_paths = {}
+for i in range(1, 5):
+    file_key = f'{mnth}_ivr{i}'
+    file_path = f"/user/2030435/CallCentreAnalystics/{mnth}_ivr{i}.csv"
+    ivr_file_paths[file_key] = file_path
 
-    valid = parsed.filter(
-        col("customer_id").isNotNull() &
-        col("event_ts").isNotNull()
-    )
+callcc = f"/user/2030435/CallCentreAnalystics/{mnth}_call.csv"
+chat_cc = f"/user/2030435/CallCentreAnalystics/{mnth}_chat.csv"
 
-    print("Valid rows:", valid.count())
+# Function to read and clean chat data
+def read_chat_data(file_path):
+    df_chat = spark.read.csv(file_path, header=True)
+    df_chat = df_chat.filter(df_chat["Pre/Post"] == "Postlogin")
+    df_chat = df_chat.withColumn("StartTime", substring(df_chat.StartTime, 1, 5))
+    df_chat = df_chat.select("REL ID", "Date28", "StartTime").withColumnRenamed("REL ID", "user_id")
+    df_chat = df_chat.withColumn("channel_name", lit("Chat"))
+    return df_chat
 
-    return valid.withColumn("channel", lit(channel))
+def read_stacy_data(file_path):
+    df = spark.read.csv(file_path, header=True)
+    df = df.withColumn("HKT_date", substring(df.HKT, 1, 10))
+    df = df.withColumn("HKT_time", substring(df.HKT, 12, 16))
+    df = df.select("user_id", "HKT_date", "HKT_time")
+    df = df.withColumn("channel_name", lit("Stacy"))
+    return df
 
-# =========================
-# HOLDERS
-# =========================
-overview = []
-overview_post = []
-unique_data = []
-ratio_data = []
-all_flow = []
+def read_call_data(file_path):
+    df = spark.read.csv(file_path, header=True)
+    df = df.withColumn("Call Start Time_date", substring(df["Call Start Time"], 1, 10))
+    df = df.withColumn("Call Start Time_time", substring(df["Call Start Time"], 12, 16))
+    df = df.select("Customer No (CTI)", "Call Start Time_date", "Call Start Time_time")
+    df = df.withColumn("channel_name", lit("Call"))
+    return df
 
-# =========================
-# MAIN LOOP
-# =========================
-for part, mnth in months.items():
-    print(f"\n================ {part} ================")
+def read_ivr_data(file_path):
+    df = spark.read.csv(file_path, header=True)
+    df = df.filter(col("ONE_FA").isin(post_login_values))
+    df = df.withColumn("STARTTIME_date", substring(df.STARTTIME, 1, 10))
+    df = df.withColumn("STARTTIME_time", substring(df.STARTTIME, 12, 16))
+    df = df.select("REL_ID", "STARTTIME_date", "STARTTIME_time")
+    df = df.withColumn("channel_name", lit("IVR"))
+    return df
 
-    stacy_dfs = []
-    ivr_dfs = []
-
-    # ===== STACY =====
-    for lang in ["en", "zh"]:
-        for auth in ["pre", "post"]:
-            path = f"/user/2030435/CallCentreAnalystics/{mnth}_stacy_{lang}_{auth}login.csv"
+# Read Stacy data
+stacy_dfs = []
+for cnt in stacy_cnt:
+    for auth in stacy_auth:
+        key = f'{mnth}_stacy_{cnt}_{auth}'
+        if 'post' in key:
+            path = file_paths_stacy[key]
             if hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(path)):
-                df = spark.read.csv(path, header=True)
-                user_col = "user_id" if "user_id" in df.columns else "customer_id"
-                stacy_dfs.append((auth, df, user_col))
+                df = read_stacy_data(path)
+                stacy_dfs.append(df)
+            else:
+                print(f"File not found: {path}")
 
-    # ===== IVR =====
-    for i in range(1, 5):
-        path = f"/user/2030435/CallCentreAnalystics/{mnth}_ivr{i}.csv"
-        if hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(path)):
-            ivr_dfs.append(spark.read.csv(path, header=True))
+# Read IVR data
+ivr_dfs = []
+for key, path in ivr_file_paths.items():
+    if hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(path)):
+        df = read_ivr_data(path)
+        ivr_dfs.append(df)
+    else:
+        print(f"IVR file not found: {path}")
 
-    # ===== CALL =====
-    call_path = f"/user/2030435/CallCentreAnalystics/{mnth}_call.csv"
-    df_call = spark.read.csv(call_path, header=True) if hadoop_fs.exists(
-        spark._jvm.org.apache.hadoop.fs.Path(call_path)
-    ) else None
+# Read Call and Chat data
+if hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(callcc)):
+    df_call_cc = read_call_data(callcc)
+else:
+    df_call_cc = None
+    print(f"Call file not found: {callcc}")
 
-    # ===== CHAT =====
-    chat_path = f"/user/2030435/CallCentreAnalystics/{mnth}_chat.csv"
-    df_chat = spark.read.csv(chat_path, header=True) if hadoop_fs.exists(
-        spark._jvm.org.apache.hadoop.fs.Path(chat_path)
-    ) else None
+if hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(chat_cc)):
+    df_chat_cc = read_chat_data(chat_cc)
+else:
+    df_chat_cc = None
+    print(f"Chat file not found: {chat_cc}")
 
-    # =========================
-    # FLOW (POST LOGIN ONLY)
-    # =========================
-    flow_parts = []
+# Combine all data into a single DataFrame
+df_combined = None
+if stacy_dfs:
+    df_combined = stacy_dfs[0]
+    for df in stacy_dfs[1:]:
+        df_combined = df_combined.union(df)
 
-    for auth, df, user_col in stacy_dfs:
-        if auth == "post":
-            norm = normalize(df, "Stacy", user_col)
-            if norm:
-                flow_parts.append(norm)
+if ivr_dfs:
+    if df_combined:
+        for df in ivr_dfs:
+            df_combined = df_combined.union(df)
+    else:
+        df_combined = ivr_dfs[0]
+        for df in ivr_dfs[1:]:
+            df_combined = df_combined.union(df)
 
-    for df in ivr_dfs:
-        norm = normalize(
-            df.filter(col("ONE_FA").isin(post_login_values)),
-            "IVR", "REL_ID"
-        )
-        if norm:
-            flow_parts.append(norm)
+if df_call_cc:
+    if df_combined:
+        df_combined = df_combined.union(df_call_cc)
+    else:
+        df_combined = df_call_cc
 
-    if df_call:
-        norm = normalize(
-            df_call.filter(col("Verification Status") == "Pass"),
-            "Call", "Customer No (CTI)"
-        )
-        if norm:
-            flow_parts.append(norm)
+if df_chat_cc:
+    if df_combined:
+        df_combined = df_combined.union(df_chat_cc)
+    else:
+        df_combined = df_chat_cc
 
-    if df_chat:
-        norm = normalize(
-            df_chat.filter(col("Pre/Post") == "Postlogin"),
-            "Live Chat", "REL ID"
-        )
-        if norm:
-            flow_parts.append(norm)
+# Drop rows where user_id is null
+if df_combined:
+    df_combined = df_combined.dropna(subset=["user_id"])
 
-    if flow_parts:
-        all_flow.append(
-            reduce(lambda a, b: a.unionByName(b), flow_parts)
-            .withColumn("month", lit(part))
-        )
+    channels = ["Stacy", "Chat", "Call", "IVR"]
 
-# =========================
-# FLOW ANALYSIS
-# =========================
-combined_flow = reduce(lambda a, b: a.unionByName(b), all_flow)
-print("\nFINAL FLOW COUNT:", combined_flow.count())
-
-w = Window.partitionBy("month", "customer_id").orderBy("event_ts")
-flow_df = combined_flow.withColumn("contact_order", row_number().over(w))
-
-first_contact = flow_df.filter(col("contact_order") == 1) \
-    .groupBy("month", "channel").count()
-
-second_channel = flow_df.filter(col("contact_order") == 2) \
-    .groupBy("month", "channel").count()
-
-followups = flow_df.filter(col("contact_order") > 1) \
-    .groupBy("month", "customer_id").count()
-
-# =========================
-# SHOW
-# =========================
-combined_flow.show(10, False)
-first_contact.show()
-second_channel.show()
-followups.show()
+    for channel in channels:
+        # Calculate the number of cases that start with the channel
+        cases_start_channel = df_combined.filter(col("channel_name") == channel).agg(count("user_id").alias("cases_start_channel")).collect()[0]["cases_start_channel"]
+        
+        # Calculate the number of unique customers that start with the channel
+        customers_start_channel = df_combined.filter(col("channel_name") == channel).select("user_id").distinct().count()
+        
+        # Calculate the repeated rate
+        repeated_rate = (cases_start_channel - df_combined.filter(col("channel_name") == channel).dropDuplicates(["user_id"]).count()) / cases_start_channel
+        
+        # Calculate the follow-up cases
+        follow_up_cases = df_combined.groupBy("user_id").agg(count("channel_name").alias("follow_up_count"))
+        follow_up_cases = follow_up_cases.groupBy("follow_up_count").agg(count("user_id").alias("cases_count")).orderBy("follow_up_count")
+        
+        # Calculate the second contact channel
+        window_spec = Window.partitionBy("user_id").orderBy("HKT_date", "HKT_time")
+        df_second_contact = df_combined.withColumn("row_number", row_number().over(window_spec)).filter(col("row_number") == 2)
+        second_contact_channel = df_second_contact.groupBy("channel_name").agg(count("user_id").alias("second_contact_cases"))
+        
+        # Display the results
+        print(f"Analysis for {channel}:")
+        print(f"Number of Cases that Start with {channel}: {cases_start_channel}")
+        print(f"Number of Unique Customers that Start with {channel}: {customers_start_channel}")
+        print(f"Repeated Rate for {channel}: {repeated_rate * 100:.2f}%")
+        
+        print(f"Follow-up Cases for {channel}:")
+        follow_up_cases.show(1000)
+        
+        print(f"Second Contact Channel after {channel}:")
+        second_contact_channel.show()
+else:
+    print("No data available for the month of January.")
