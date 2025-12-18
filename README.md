@@ -1,22 +1,11 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, substring, lit, row_number, count, when, concat_ws, to_timestamp
+from pyspark.sql.functions import col, lit, row_number, count, when, concat_ws, to_timestamp
 from pyspark.sql.window import Window
 
-spark = SparkSession.builder.appName("ChannelFlowAnalysis").getOrCreate()
+spark = SparkSession.builder.appName("JanChannelFlowAnalysis").getOrCreate()
 
-months = {
-    "jan": "202501", "feb": "202502", "mar": "202503",
-    "apr": "202504", "may": "202505", "jun": "202506",
-    "jul": "202507", "aug": "202508", "sep": "202509",
-    "oct": "202510", "nov": "202511"
-}
-
-total_HK_clients = {
-    "202501": 1748757, "202502": 1749000, "202503": 1750000,
-    "202504": 1751000, "202505": 1752000, "202506": 1753000,
-    "202507": 1754000, "202508": 1755000, "202509": 1756000,
-    "202510": 1757000, "202511": 1758000
-}
+mnth = "jan"
+part = "202501"
 
 stacy_cnt = ["en", "zh"]
 stacy_auth = ["post"]
@@ -33,10 +22,10 @@ def read_stacy(path):
     elif "date (UTC)" in df.columns:
         df = df.withColumn("event_ts", to_timestamp(col("date (UTC)"), "dd-MM-yyyy HH:mm"))
     if "user_id" in df.columns:
-        df = df.select(col("user_id"))
+        df = df.select(col("user_id"), col("event_ts"))
     else:
-        df = df.select(col("customer_id").alias("user_id"))
-    return df.withColumn("channel", lit("Stacy")).withColumn("event_ts", col("event_ts"))
+        df = df.select(col("customer_id").alias("user_id"), col("event_ts"))
+    return df.withColumn("channel", lit("Stacy"))
 
 def read_ivr(path):
     df = spark.read.csv(path, header=True)
@@ -61,55 +50,46 @@ def read_chat(path):
     return df.select(col("REL ID").alias("user_id"), col("event_ts")) \
              .withColumn("channel", lit("Chat"))
 
-all_months = []
+dfs = []
 
-for mnth, part in months.items():
-    dfs = []
-
-    for cnt in stacy_cnt:
-        for auth in stacy_auth:
-            path = f"/user/2030435/CallCentreAnalystics/{mnth}_stacy_{cnt}_{auth}login.csv"
-            if hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(path)):
-                dfs.append(read_stacy(path))
-
-    for i in range(1, 5):
-        path = f"/user/2030435/CallCentreAnalystics/{mnth}_ivr{i}.csv"
+for cnt in stacy_cnt:
+    for auth in stacy_auth:
+        path = f"/user/2030435/CallCentreAnalystics/{mnth}_stacy_{cnt}_{auth}login.csv"
         if hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(path)):
-            dfs.append(read_ivr(path))
+            dfs.append(read_stacy(path))
 
-    call_path = f"/user/2030435/CallCentreAnalystics/{mnth}_call.csv"
-    if hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(call_path)):
-        dfs.append(read_call(call_path))
+for i in range(1, 5):
+    path = f"/user/2030435/CallCentreAnalystics/{mnth}_ivr{i}.csv"
+    if hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(path)):
+        dfs.append(read_ivr(path))
 
-    chat_path = f"/user/2030435/CallCentreAnalystics/{mnth}_chat.csv"
-    if hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(chat_path)):
-        dfs.append(read_chat(chat_path))
+call_path = f"/user/2030435/CallCentreAnalystics/{mnth}_call.csv"
+if hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(call_path)):
+    dfs.append(read_call(call_path))
 
-    if dfs:
-        df_month = dfs[0]
-        for d in dfs[1:]:
-            df_month = df_month.union(d)
-        df_month = df_month.dropna(subset=["user_id", "event_ts"])
-        df_month = df_month.withColumn("month", lit(part))
-        all_months.append(df_month)
+chat_path = f"/user/2030435/CallCentreAnalystics/{mnth}_chat.csv"
+if hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(chat_path)):
+    dfs.append(read_chat(chat_path))
 
-combined_df = all_months[0]
-for d in all_months[1:]:
+combined_df = dfs[0]
+for d in dfs[1:]:
     combined_df = combined_df.union(d)
 
-w = Window.partitionBy("month", "user_id").orderBy("event_ts")
+combined_df = combined_df.dropna(subset=["user_id", "event_ts"])
+
+w = Window.partitionBy("user_id").orderBy("event_ts")
 df_ranked = combined_df.withColumn("rn", row_number().over(w))
 
 channels = ["Stacy", "IVR", "Call", "Chat"]
 
 for ch in channels:
     starters = df_ranked.filter((col("rn") == 1) & (col("channel") == ch)) \
-                         .select("month", "user_id")
+                         .select("user_id")
 
     if starters.count() == 0:
         continue
 
-    scoped = df_ranked.join(starters, ["month", "user_id"])
+    scoped = df_ranked.join(starters, ["user_id"])
 
     total_cases = scoped.count()
     unique_customers = scoped.select("user_id").distinct().count()
