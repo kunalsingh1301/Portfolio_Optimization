@@ -5,6 +5,9 @@ from pyspark.sql.window import Window
 # ---------------- SPARK SESSION ----------------
 spark = SparkSession.builder.appName("ChannelFlowNormalized").getOrCreate()
 
+# Use LEGACY parser to avoid Spark 3+ strict timestamp parsing issues
+spark.conf.set("spark.sql.legacy.timeParserPolicy", "LEGACY")
+
 # ---------------- CONFIG ----------------
 mnth = "jan"
 part = "202501"
@@ -22,19 +25,25 @@ def path_exists(p):
     return hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(p))
 
 # ---------------- SAFE NORMALIZATION ----------------
-from pyspark.sql.functions import coalesce, to_timestamp, regexp_replace, date_format, col
-
 def normalize_timestamp(df, ts_col):
-    # Step 1: Normalize AM/PM for 24-hour time (remove invalid AM/PM)
-    df = df.withColumn("_ts_clean", regexp_replace(col(ts_col), r"([1-2]?[0-9]):([0-5][0-9])\s?(AM|PM)$", r"\1:\2"))
+    """
+    Normalize messy timestamps into Spark TimestampType safely.
+    Handles:
+      - 1 or 2 digit day/month
+      - 2 or 4 digit year
+      - 24-hour and 12-hour with AM/PM
+      - Missing seconds
+    """
+    # Step 0: Clean extra spaces
+    df = df.withColumn("_ts_clean", trim(col(ts_col)))
 
-    # Step 2: Fill missing seconds
+    # Step 1: Fill missing seconds (e.g., "01-01-25 22:07" -> "01-01-25 22:07:00")
     df = df.withColumn("_ts_clean",
                        when(col("_ts_clean").rlike(r"^\d{1,2}-\d{1,2}-\d{2,4} \d{1,2}:\d{2}$"),
                             concat_ws(":", col("_ts_clean"), lit("00")))
                        .otherwise(col("_ts_clean")))
 
-    # Step 3: Try multiple formats
+    # Step 2: Try multiple date/time formats
     formats = [
         "d-M-yy HH:mm:ss",
         "d-M-yy hh:mm:ss a",
@@ -48,8 +57,9 @@ def normalize_timestamp(df, ts_col):
     exprs = [to_timestamp(col("_ts_clean"), f) for f in formats]
     df = df.withColumn("event_ts", coalesce(*exprs))
 
-    # Step 4: Standardize format
-    df = df.withColumn("event_ts", date_format(col("event_ts"), "dd-MM-yyyy HH:mm:ss"))
+    # Step 3: Cast invalid timestamps to null (failsafe)
+    df = df.withColumn("event_ts", col("event_ts").cast("timestamp"))
+
     return df.drop("_ts_clean")
 
 # ---------------- READERS ----------------
@@ -117,12 +127,15 @@ if path_exists(chat_p):
     dfs.append(read_chat(chat_p))
 
 # ---------------- COMBINE ----------------
+if not dfs:
+    raise ValueError("No data files found!")
+
 combined_df = dfs[0]
 for d in dfs[1:]:
     combined_df = combined_df.unionByName(d)
 
 combined_df = combined_df.dropna(subset=["user_id", "event_ts"]).cache()
-combined_df.count()  # materialize once
+combined_df.count()  # materialize cache
 
 # ---------------- SEQUENCE ----------------
 w = Window.partitionBy("user_id").orderBy("event_ts")
@@ -132,10 +145,12 @@ df = combined_df.withColumn("rn", row_number().over(w))
 results = []
 
 for ch in channels:
+    # Step 1: Find users whose first channel is this channel
     starters = df.filter((col("rn") == 1) & (col("channel") == ch)) \
                  .select("user_id").distinct()
     scoped = df.join(starters, "user_id")
 
+    # Step 2: Overall aggregation
     agg = scoped.agg(
         count("*").alias("Total_case"),
         countDistinct("user_id").alias("uniq_cust")
@@ -145,6 +160,7 @@ for ch in channels:
     uniq_cust = agg["uniq_cust"]
     rep_rate = (total_case - uniq_cust) * 100 / total_case if total_case else 0
 
+    # Step 3: Follow-up buckets
     bucket = (
         scoped.groupBy("user_id").count()
         .withColumn(
@@ -158,6 +174,7 @@ for ch in channels:
     )
     bmap = {r["bucket"]: r["count"] for r in bucket.collect()}
 
+    # Step 4: Top N channels for 2nd & 3rd events
     def top_n(n):
         rows = (
             scoped.filter(col("rn") == n)
@@ -172,6 +189,7 @@ for ch in channels:
     sec_ch, sec_ct = top_n(2)
     thr_ch, thr_ct = top_n(3)
 
+    # Step 5: Append results
     results.append([
         part, ch, total_case, uniq_cust, rep_rate,
         bmap.get("0", 0), bmap.get("1", 0),
@@ -192,5 +210,3 @@ columns = [
 
 output_df = spark.createDataFrame(results, columns)
 output_df.show(truncate=False)
-
-Py4JJavaError: An error occurred while calling o580.count. : org.apache.spark.SparkException: Job aborted due to stage failure: Task 5 in stage 8.0 failed 4 times, most recent failure: Lost task 5.3 in stage 8.0 (TID 15) (hkigwdjs48xwn08.hk.standardchartered.com executor 1): org.apache.spark.SparkUpgradeException: You may get a different result due to the upgrading to Spark >= 3.0: Fail to parse '01-01-2025 22:07:00' in the new parser. You can set spark.sql.legacy.timeParserPolicy to LEGACY to restore the behavior before Spark 3.0, or set to CORRECTED and treat it as an invalid datetime string. at org.apache.spark.sql.errors.QueryExecutionErrors$.failToParseDateTimeInNewParserError(QueryExecutionErrors.scala:1083) at org.apache.spark.sql.catalyst.util.DateTimeFormatterHelper$$anonfun$checkParsedDiff$1.applyOrElse(DateTimeFormatterHelper.scala:148) at org.apache.spark.sql.catalyst.util.DateTimeFormatterHelper$$anonfun$checkParsedDiff$1.applyOrElse(DateTimeFormatterHelper.scala:141) at scala.runtime.AbstractPartialFunction.apply(AbstractPartialFunction.scala:38) at org.apache.spark.sql.catalyst.util.Iso8601TimestampFormatter.parse(TimestampFormatter.scala:176) at org.apache.spark.sql.catalyst.expressions.GeneratedClass$GeneratedIteratorForCodegenStage4.processNext(Unknown Source) at org.apache.spark.sql.execution.BufferedRowIterator.hasNext(BufferedRowIterator.java:43) at org.apache.spark.sql.execution.WholeStageCodegenExec$$anon$1.hasNext(WholeStageCodegenExec.scala:760) at org.apache.spark.sql.execution.columnar.DefaultCac
