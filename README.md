@@ -17,9 +17,7 @@ post_login_values = ["OTP|S", "VB|S", "TPIN|S"]
 channels = ["Stacy", "IVR", "Call", "Chat"]
 
 hadoop_fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
-
-def path_exists(p):
-    return hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(p))
+def path_exists(p): return hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(p))
 
 # ---------------- SAFE TIMESTAMP NORMALIZATION ----------------
 def normalize_timestamp(df, ts_col):
@@ -35,8 +33,7 @@ def normalize_timestamp(df, ts_col):
     ]
     exprs = [to_timestamp(col("_ts_clean"), f) for f in formats]
     df = df.withColumn("event_ts", coalesce(*exprs))
-    df = df.withColumn("event_ts", col("event_ts").cast("timestamp"))
-    return df.drop("_ts_clean")
+    return df.drop("_ts_clean").withColumn("event_ts", col("event_ts").cast("timestamp"))
 
 # ---------------- SAFE READER ----------------
 def safe_read(func, path):
@@ -78,7 +75,6 @@ def read_chat(path):
 
 # ---------------- LOAD DATA ----------------
 dfs = []
-
 for cnt in stacy_cnt:
     for auth in stacy_auth:
         p = f"/user/2030435/CallCentreAnalystics/{mnth}_stacy_{cnt}_{auth}login.csv"
@@ -100,89 +96,54 @@ if df: dfs.append(df)
 
 if not dfs: raise ValueError("No valid data files found!")
 
-# Union all at once
-from functools import reduce
-combined_df = reduce(lambda a, b: a.unionByName(b), dfs)
+combined_df = reduce(lambda a,b: a.unionByName(b), dfs)
+combined_df = combined_df.dropna(subset=["user_id","event_ts"]).repartition("user_id").cache()
 
-# Drop missing and repartition for window
-combined_df = combined_df.dropna(subset=["user_id", "event_ts"]).repartition("user_id").cache()
-
-# ---------------- SEQUENCE ----------------
+# ---------------- ADD STARTER CHANNEL ----------------
 w = Window.partitionBy("user_id").orderBy("event_ts")
 df = combined_df.withColumn("rn", row_number().over(w))
 
-# ---------------- AGGREGATIONS ----------------
-# Total case per first channel
-first_channel = df.filter(col("rn")==1).groupBy("channel").agg(
-    count("*").alias("Total_case"),
+starter_df = df.filter(col("rn")==1).select("user_id", col("channel").alias("starter_channel"))
+df = df.join(starter_df, "user_id")
+
+# ---------------- TOTAL CASE & REP RATE ----------------
+agg_df = df.groupBy("starter_channel").agg(
+    count("*").alias("total_case"),
     countDistinct("user_id").alias("uniq_cust")
+).withColumn(
+    "rep_rate", ((col("total_case") - col("uniq_cust")) * 100 / col("total_case"))
 )
 
-# Follow-up bucket per channel
-follow_up = df.groupBy("user_id").count().withColumn(
-    "bucket",
-    when(col("count")==1, "0")
-    .when(col("count")==2, "1")
-    .when(col("count")==3, "2")
-    .otherwise("3+")
+# ---------------- FOLLOW-UP BUCKETS ----------------
+follow_up = df.groupBy("starter_channel", "user_id").count().withColumn(
+    "bucket", when(col("count")==1,"0")
+              .when(col("count")==2,"1")
+              .when(col("count")==3,"2")
+              .otherwise("3+")
 )
+bucket_agg = follow_up.groupBy("starter_channel", "bucket").count()
+bucket_pivot = bucket_agg.groupBy("starter_channel").pivot("bucket", ["0","1","2","3+"]).sum("count").fillna(0)
 
-bucket_agg = follow_up.groupBy("bucket").count().collect()
-bmap = {r['bucket']: r['count'] for r in bucket_agg}
+# ---------------- TOP 2ND & 3RD CHANNELS ----------------
+df2 = df.filter(col("rn")==2)
+df3 = df.filter(col("rn")==3)
 
-# Top 2nd and 3rd channels
-# Extract 2nd and 3rd events
-events = df.filter(col("rn").isin([2,3]))
-events_pivot = events.groupBy("user_id").pivot("rn").agg(first("channel"))
+top2 = df2.groupBy("starter_channel", "channel").count()
+top2_pivot = top2.groupBy("starter_channel").pivot("channel").sum("count").fillna(0)
 
-# Count top channels
-top2 = events.filter(col("rn")==2).groupBy("channel").count()
-top3 = events.filter(col("rn")==3).groupBy("channel").count()
+top3 = df3.groupBy("starter_channel", "channel").count()
+top3_pivot = top3.groupBy("starter_channel").pivot("channel").sum("count").fillna(0)
 
-# Assemble final result
-results = []
+# ---------------- FINAL OUTPUT ----------------
+final_df = agg_df.join(bucket_pivot, "starter_channel", "left") \
+                 .join(top2_pivot, "starter_channel", "left") \
+                 .join(top3_pivot, "starter_channel", "left") \
+                 .withColumnRenamed("starter_channel","Channel") \
+                 .withColumn("Date", lit(part))
 
-fc_collect = first_channel.collect()
-top2_dict = {r['channel']: r['count'] for r in top2.collect()}
-top3_dict = {r['channel']: r['count'] for r in top3.collect()}
+# Reorder columns (optional)
+cols = ["Date","Channel","total_case","uniq_cust","rep_rate","0","1","2","3+"] + \
+       [c for c in top2_pivot.columns if c!="starter_channel"] + \
+       [c for c in top3_pivot.columns if c!="starter_channel"]
 
-for r in fc_collect:
-    ch = r['channel']
-    total_case = r['Total_case']
-    uniq_cust = r['uniq_cust']
-    rep_rate = (total_case - uniq_cust)*100/total_case if total_case else 0
-
-    # Buckets
-    f0 = bmap.get("0",0)
-    f1 = bmap.get("1",0)
-    f2 = bmap.get("2",0)
-    f3 = bmap.get("3+",0)
-
-    # Top 2nd/3rd channels (sorted)
-    sec_ch = sorted(top2_dict.items(), key=lambda x: -x[1])
-    sec_ch_names = [x[0] for x in sec_ch[:4]] + [""]*(4-len(sec_ch[:4]))
-    sec_ch_counts = [x[1] for x in sec_ch[:4]] + [0]*(4-len(sec_ch[:4]))
-
-    thr_ch = sorted(top3_dict.items(), key=lambda x: -x[1])
-    thr_ch_names = [x[0] for x in thr_ch[:4]] + [""]*(4-len(thr_ch[:4]))
-    thr_ch_counts = [x[1] for x in thr_ch[:4]] + [0]*(4-len(thr_ch[:4]))
-
-    results.append([
-        part, ch, total_case, uniq_cust, rep_rate,
-        f0,f1,f2,f3,
-        *sec_ch_names, *sec_ch_counts,
-        *thr_ch_names, *thr_ch_counts
-    ])
-
-# ---------------- OUTPUT ----------------
-columns = [
-    "Date", "Channel", "Total_case", "uniq_cust", "rep_rate",
-    "follow_up_0", "follow_up_1", "follow_up_2", "follow_up_3+",
-    "sec_con_chnl_1", "sec_con_chnl_2", "sec_con_chnl_3", "sec_con_chnl_4",
-    "sec_con_chnl_count_1", "sec_con_chnl_count_2", "sec_con_chnl_count_3", "sec_con_chnl_count_4",
-    "third_con_chnl_1", "third_con_chnl_2", "third_con_chnl_3", "third_con_chnl_4",
-    "third_con_chnl_count_1", "third_con_chnl_count_2", "third_con_chnl_count_3", "third_con_chnl_count_4"
-]
-
-output_df = spark.createDataFrame(results, columns)
-output_df.show(truncate=False)
+final_df.select(cols).show(truncate=False)
