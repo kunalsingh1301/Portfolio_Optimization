@@ -75,7 +75,6 @@ def read_chat(path):
 
 # ---------------- LOAD DATA ----------------
 dfs = []
-
 for cnt in stacy_cnt:
     for auth in stacy_auth:
         p = f"/user/2030435/CallCentreAnalystics/{mnth}_stacy_{cnt}_{auth}login.csv"
@@ -95,8 +94,7 @@ chat_p = f"/user/2030435/CallCentreAnalystics/{mnth}_chat.csv"
 df = safe_read(read_chat, chat_p)
 if df: dfs.append(df)
 
-if not dfs: 
-    raise ValueError("No valid data files found!")
+if not dfs: raise ValueError("No valid data files found!")
 
 combined_df = reduce(lambda a,b: a.unionByName(b), dfs)
 combined_df = combined_df.dropna(subset=["user_id","event_ts"]).repartition("user_id").cache()
@@ -130,30 +128,29 @@ bucket_pivot = bucket_pivot.withColumnRenamed("0","follow_up_0") \
                            .withColumnRenamed("3+","follow_up_3+")
 
 # ---------------- TOP 2ND & 3RD CHANNELS ----------------
-def pivot_top_channels(df_events, rn, prefix, top_n=4):
-    df_rn = df_events.filter(col("rn")==rn)
-    # get counts per user
-    top_df = df_rn.groupBy("starter_channel", "channel").count()
-    # rank channels per starter_channel
-    w = Window.partitionBy("starter_channel").orderBy(col("count").desc())
-    top_df = top_df.withColumn("rank", row_number().over(w))
-    # only take top_n channels
-    top_df = top_df.filter(col("rank") <= top_n)
-    # create pivoted names
-    pivoted = top_df.groupBy("starter_channel").pivot("rank", list(range(1, top_n+1))).agg(
-        first("channel").alias("chnl"),
+def top_n_channels(df_events, n):
+    """Return top 4 channels and counts per starter_channel for rank n"""
+    df_rank = df_events.filter(col("rn")==n)
+    top_ch = (df_rank.groupBy("starter_channel", "channel")
+                     .count()
+                     .withColumn("rn_order", row_number().over(
+                         Window.partitionBy("starter_channel").orderBy(col("count").desc(), col("channel"))
+                     ))
+                     .filter(col("rn_order") <= 4)
+               )
+    # Pivot to list
+    pivoted_ch = top_ch.groupBy("starter_channel").pivot("rn_order").agg(
+        first("channel").alias("channel"),
         first("count").alias("count")
-    )
-    # flatten column names
-    for i in range(1, top_n+1):
-        if f"chnl_{i}" in pivoted.columns:
-            pivoted = pivoted.withColumnRenamed(f"chnl_{i}", f"{prefix}_chnl_{i}")
-        if f"count_{i}" in pivoted.columns:
-            pivoted = pivoted.withColumnRenamed(f"count_{i}", f"{prefix}_chnl_count_{i}")
-    return pivoted
+    ).fillna("")
+    # rename columns
+    for i in range(1,5):
+        pivoted_ch = pivoted_ch.withColumnRenamed(f"channel_{i}", f"{'sec' if n==2 else 'third'}_chnl_{i}")
+        pivoted_ch = pivoted_ch.withColumnRenamed(f"count_{i}", f"{'sec' if n==2 else 'third'}_chnl_count_{i}")
+    return pivoted_ch
 
-top2_pivot = pivot_top_channels(df, 2, "sec")
-top3_pivot = pivot_top_channels(df, 3, "third")
+top2_pivot = top_n_channels(df, 2)
+top3_pivot = top_n_channels(df, 3)
 
 # ---------------- FINAL OUTPUT ----------------
 final_df = agg_df.join(bucket_pivot, "starter_channel", "left") \
@@ -162,7 +159,7 @@ final_df = agg_df.join(bucket_pivot, "starter_channel", "left") \
                  .withColumnRenamed("starter_channel","Channel") \
                  .withColumn("Date", lit(part))
 
-# ---------------- FIX SCHEMA ----------------
+# ---------------- REORDER COLUMNS ----------------
 columns = [
     "Date", "Channel", "total_case", "uniq_cust", "rep_rate",
     "follow_up_0", "follow_up_1", "follow_up_2", "follow_up_3+",
@@ -172,14 +169,4 @@ columns = [
     "third_chnl_count_1", "third_chnl_count_2", "third_chnl_count_3", "third_chnl_count_4"
 ]
 
-# fill missing columns with null
-from pyspark.sql import functions as F
-for c in columns:
-    if c not in final_df.columns:
-        final_df = final_df.withColumn(c, F.lit(None))
-
-# reorder columns
-final_df = final_df.select(columns)
-
-# ---------------- SHOW OUTPUT ----------------
-final_df.show(truncate=False)
+final_df.select([c for c in columns if c in final_df.columns]).show(truncate=False)
