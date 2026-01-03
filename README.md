@@ -6,7 +6,7 @@ from functools import reduce
 # ------------------------------------------------------------------------------
 # CONFIG
 # ------------------------------------------------------------------------------
-spark = SparkSession.builder.appName("ChannelFlowAnalysis_Option2").getOrCreate()
+spark = SparkSession.builder.appName("ChannelFlowAnalysis_Option2_Full").getOrCreate()
 
 mnth = "jan"
 part = "202501"
@@ -46,29 +46,38 @@ def read_stacy(path):
     ts_col = "HKT" if "HKT" in df.columns else "date (UTC)"
     uid_col = "user_id" if "user_id" in df.columns else "customer_id"
 
-    df = df.select(col(uid_col).alias("user_id"), col(ts_col))
-    df = parse_timestamp(df, ts_col)  # create canonical event_ts
-    return df.withColumn("event_channel", lit("Stacy"))
+    df = df.select(
+        col(uid_col).alias("user_id"),
+        col(ts_col)
+    )
+    df = parse_timestamp(df, ts_col)
+    df = df.withColumn("event_channel", lit("Stacy"))
+    df = df.drop(ts_col)  # drop original column to avoid union issues
+    return df
 
 def read_ivr(path):
     df = spark.read.csv(path, header=True)
     df = df.filter(col("ONE_FA").isin(post_login_values))
     df = df.select(col("REL_ID").alias("user_id"), col("STARTTIME"))
     df = parse_timestamp(df, "STARTTIME")
-    return df.withColumn("event_channel", lit("IVR"))
+    df = df.withColumn("event_channel", lit("IVR")).drop("STARTTIME")
+    return df
 
 def read_call(path):
     df = spark.read.csv(path, header=True)
     df = df.select(col("Customer No (CTI)").alias("user_id"), col("Call Start Time"))
     df = parse_timestamp(df, "Call Start Time")
-    return df.withColumn("event_channel", lit("Call"))
+    df = df.withColumn("event_channel", lit("Call")).drop("Call Start Time")
+    return df
 
 def read_chat(path):
     df = spark.read.csv(path, header=True)
     df = df.filter(col("Pre/Post") == "Postlogin")
-    df = df.select(col("REL ID").alias("user_id"), concat_ws(" ", col("Date28"), col("StartTime")).alias("chat_ts"))
+    df = df.select(col("REL ID").alias("user_id"),
+                   concat_ws(" ", col("Date28"), col("StartTime")).alias("chat_ts"))
     df = parse_timestamp(df, "chat_ts")
-    return df.withColumn("event_channel", lit("Chat"))
+    df = df.withColumn("event_channel", lit("Chat")).drop("chat_ts")
+    return df
 
 # ------------------------------------------------------------------------------
 # SAFE LOAD
@@ -82,13 +91,17 @@ def safe_append(reader, path):
     else:
         print(f"[SKIP] {path}")
 
+# Stacy files
 safe_append(read_stacy, f"/user/2030435/CallCentreAnalystics/{mnth}_stacy_en_postlogin.csv")
 safe_append(read_stacy, f"/user/2030435/CallCentreAnalystics/{mnth}_stacy_zh_postlogin.csv")
-safe_append(read_call,  f"/user/2030435/CallCentreAnalystics/{mnth}_call.csv")
-safe_append(read_chat,  f"/user/2030435/CallCentreAnalystics/{mnth}_chat.csv")
 
+# IVR files
 for i in range(1, 5):
     safe_append(read_ivr, f"/user/2030435/CallCentreAnalystics/{mnth}_ivr{i}.csv")
+
+# Call & Chat files
+safe_append(read_call, f"/user/2030435/CallCentreAnalystics/{mnth}_call.csv")
+safe_append(read_chat, f"/user/2030435/CallCentreAnalystics/{mnth}_chat.csv")
 
 if not dfs:
     raise Exception("No input files found")
@@ -96,14 +109,16 @@ if not dfs:
 # ------------------------------------------------------------------------------
 # COMBINE DATA
 # ------------------------------------------------------------------------------
-combined_df = reduce(lambda a, b: a.unionByName(b), dfs).dropna(subset=["user_id", "event_ts"])
+combined_df = reduce(lambda a, b: a.unionByName(b), dfs)
+combined_df = combined_df.dropna(subset=["user_id", "event_ts"])
+combined_df.cache()
+combined_df.count()  # triggers parsing
 
 # ------------------------------------------------------------------------------
 # RANK EVENTS
 # ------------------------------------------------------------------------------
 w = Window.partitionBy("user_id").orderBy("event_ts")
-ranked = combined_df.withColumn("rn", row_number().over(w)).cache()
-ranked.count()  # triggers parsing
+ranked = combined_df.withColumn("rn", row_number().over(w))
 
 # ------------------------------------------------------------------------------
 # REFERENCE CHANNEL
@@ -134,8 +149,6 @@ followup_pivot = (
         .when(col("count") == 3, "follow_up_2")
         .otherwise("follow_up_3+")
     )
-    .groupBy("ref_channel", "bucket")
-    .count()
     .groupBy("ref_channel")
     .pivot("bucket", ["follow_up_0", "follow_up_1", "follow_up_2", "follow_up_3+"])
     .sum("count")
