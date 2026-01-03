@@ -102,7 +102,6 @@ combined_df = combined_df.dropna(subset=["user_id","event_ts"]).repartition("use
 # ---------------- ADD STARTER CHANNEL ----------------
 w = Window.partitionBy("user_id").orderBy("event_ts")
 df = combined_df.withColumn("rn", row_number().over(w))
-
 starter_df = df.filter(col("rn")==1).select("user_id", col("channel").alias("starter_channel"))
 df = df.join(starter_df, "user_id")
 
@@ -123,16 +122,26 @@ follow_up = df.groupBy("starter_channel", "user_id").count().withColumn(
 )
 bucket_agg = follow_up.groupBy("starter_channel", "bucket").count()
 bucket_pivot = bucket_agg.groupBy("starter_channel").pivot("bucket", ["0","1","2","3+"]).sum("count").fillna(0)
+bucket_pivot = bucket_pivot.withColumnRenamed("0","follow_up_0") \
+                           .withColumnRenamed("1","follow_up_1") \
+                           .withColumnRenamed("2","follow_up_2") \
+                           .withColumnRenamed("3+","follow_up_3+")
 
 # ---------------- TOP 2ND & 3RD CHANNELS ----------------
+def pivot_top(df_events, rank, prefix):
+    top = df_events.groupBy("starter_channel", "channel").count()
+    pivot = top.groupBy("starter_channel").pivot("channel").sum("count").fillna(0)
+    # rename columns
+    for c in pivot.columns:
+        if c != "starter_channel":
+            pivot = pivot.withColumnRenamed(c, f"{prefix}_chnl_{c}")
+    return pivot
+
 df2 = df.filter(col("rn")==2)
 df3 = df.filter(col("rn")==3)
 
-top2 = df2.groupBy("starter_channel", "channel").count()
-top2_pivot = top2.groupBy("starter_channel").pivot("channel").sum("count").fillna(0)
-
-top3 = df3.groupBy("starter_channel", "channel").count()
-top3_pivot = top3.groupBy("starter_channel").pivot("channel").sum("count").fillna(0)
+top2_pivot = pivot_top(df2, 2, "sec_con")
+top3_pivot = pivot_top(df3, 3, "third_con")
 
 # ---------------- FINAL OUTPUT ----------------
 final_df = agg_df.join(bucket_pivot, "starter_channel", "left") \
@@ -141,9 +150,11 @@ final_df = agg_df.join(bucket_pivot, "starter_channel", "left") \
                  .withColumnRenamed("starter_channel","Channel") \
                  .withColumn("Date", lit(part))
 
-# Reorder columns (optional)
-cols = ["Date","Channel","total_case","uniq_cust","rep_rate","0","1","2","3+"] + \
-       [c for c in top2_pivot.columns if c!="starter_channel"] + \
-       [c for c in top3_pivot.columns if c!="starter_channel"]
+# ---------------- REORDER COLUMNS ----------------
+cols = ["Date","Channel","total_case","uniq_cust","rep_rate",
+        "follow_up_0","follow_up_1","follow_up_2","follow_up_3+"]
+# Add top2 and top3 columns dynamically
+cols += [c for c in top2_pivot.columns if c!="starter_channel"]
+cols += [c for c in top3_pivot.columns if c!="starter_channel"]
 
 final_df.select(cols).show(truncate=False)
