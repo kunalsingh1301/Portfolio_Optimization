@@ -24,7 +24,7 @@ hadoop_fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
 def path_exists(p):
     return hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(p))
 
-# ---------------- SAFE NORMALIZATION ----------------
+# ---------------- SAFE TIMESTAMP NORMALIZATION ----------------
 def normalize_timestamp(df, ts_col):
     """
     Normalize messy timestamps into Spark TimestampType safely.
@@ -34,16 +34,16 @@ def normalize_timestamp(df, ts_col):
       - 24-hour and 12-hour with AM/PM
       - Missing seconds
     """
-    # Step 0: Clean extra spaces
+    # Clean spaces
     df = df.withColumn("_ts_clean", trim(col(ts_col)))
 
-    # Step 1: Fill missing seconds (e.g., "01-01-25 22:07" -> "01-01-25 22:07:00")
+    # Fill missing seconds
     df = df.withColumn("_ts_clean",
                        when(col("_ts_clean").rlike(r"^\d{1,2}-\d{1,2}-\d{2,4} \d{1,2}:\d{2}$"),
                             concat_ws(":", col("_ts_clean"), lit("00")))
                        .otherwise(col("_ts_clean")))
 
-    # Step 2: Try multiple date/time formats
+    # Multiple formats
     formats = [
         "d-M-yy HH:mm:ss",
         "d-M-yy hh:mm:ss a",
@@ -56,15 +56,28 @@ def normalize_timestamp(df, ts_col):
     ]
     exprs = [to_timestamp(col("_ts_clean"), f) for f in formats]
     df = df.withColumn("event_ts", coalesce(*exprs))
-
-    # Step 3: Cast invalid timestamps to null (failsafe)
     df = df.withColumn("event_ts", col("event_ts").cast("timestamp"))
-
     return df.drop("_ts_clean")
 
-# ---------------- READERS ----------------
+# ---------------- SAFE READER WRAPPER ----------------
+def safe_read(func, path):
+    """
+    Reads a CSV safely: skips empty/malformed files
+    """
+    try:
+        if path_exists(path):
+            df = func(path)
+            if df is not None and not df.rdd.isEmpty():
+                # Clean column names (strip spaces)
+                df = df.toDF(*[c.strip() for c in df.columns])
+                return df
+    except Exception as e:
+        print(f"Skipping {path} due to error: {e}")
+    return None
+
+# ---------------- DATA READERS ----------------
 def read_stacy(path):
-    df = spark.read.csv(path, header=True)
+    df = spark.read.option("header", True).option("inferSchema", True).csv(path)
     ts_col = "HKT" if "HKT" in df.columns else "date (UTC)"
     user_col = "user_id" if "user_id" in df.columns else "customer_id"
     df = normalize_timestamp(df, ts_col)
@@ -75,7 +88,7 @@ def read_stacy(path):
     )
 
 def read_ivr(path):
-    df = spark.read.csv(path, header=True)
+    df = spark.read.option("header", True).option("inferSchema", True).csv(path)
     df = df.filter(col("ONE_FA").isin(post_login_values))
     df = normalize_timestamp(df, "STARTTIME")
     return df.select(
@@ -85,7 +98,7 @@ def read_ivr(path):
     )
 
 def read_call(path):
-    df = spark.read.csv(path, header=True)
+    df = spark.read.option("header", True).option("inferSchema", True).csv(path)
     df = normalize_timestamp(df, "Call Start Time")
     return df.select(
         col("Customer No (CTI)").alias("user_id"),
@@ -94,7 +107,7 @@ def read_call(path):
     )
 
 def read_chat(path):
-    df = spark.read.csv(path, header=True)
+    df = spark.read.option("header", True).option("inferSchema", True).csv(path)
     df = df.filter(col("Pre/Post") == "Postlogin")
     df = df.withColumn("_ts", concat_ws(" ", col("Date28"), col("StartTime")))
     df = normalize_timestamp(df, "_ts")
@@ -110,26 +123,30 @@ dfs = []
 for cnt in stacy_cnt:
     for auth in stacy_auth:
         p = f"/user/2030435/CallCentreAnalystics/{mnth}_stacy_{cnt}_{auth}login.csv"
-        if path_exists(p):
-            dfs.append(read_stacy(p))
+        df = safe_read(read_stacy, p)
+        if df:
+            dfs.append(df)
 
 for i in range(1, 5):
     p = f"/user/2030435/CallCentreAnalystics/{mnth}_ivr{i}.csv"
-    if path_exists(p):
-        dfs.append(read_ivr(p))
+    df = safe_read(read_ivr, p)
+    if df:
+        dfs.append(df)
 
 call_p = f"/user/2030435/CallCentreAnalystics/{mnth}_call.csv"
-if path_exists(call_p):
-    dfs.append(read_call(call_p))
+df = safe_read(read_call, call_p)
+if df:
+    dfs.append(df)
 
 chat_p = f"/user/2030435/CallCentreAnalystics/{mnth}_chat.csv"
-if path_exists(chat_p):
-    dfs.append(read_chat(chat_p))
+df = safe_read(read_chat, chat_p)
+if df:
+    dfs.append(df)
+
+if not dfs:
+    raise ValueError("No valid data files found!")
 
 # ---------------- COMBINE ----------------
-if not dfs:
-    raise ValueError("No data files found!")
-
 combined_df = dfs[0]
 for d in dfs[1:]:
     combined_df = combined_df.unionByName(d)
@@ -145,12 +162,10 @@ df = combined_df.withColumn("rn", row_number().over(w))
 results = []
 
 for ch in channels:
-    # Step 1: Find users whose first channel is this channel
     starters = df.filter((col("rn") == 1) & (col("channel") == ch)) \
                  .select("user_id").distinct()
     scoped = df.join(starters, "user_id")
 
-    # Step 2: Overall aggregation
     agg = scoped.agg(
         count("*").alias("Total_case"),
         countDistinct("user_id").alias("uniq_cust")
@@ -160,7 +175,6 @@ for ch in channels:
     uniq_cust = agg["uniq_cust"]
     rep_rate = (total_case - uniq_cust) * 100 / total_case if total_case else 0
 
-    # Step 3: Follow-up buckets
     bucket = (
         scoped.groupBy("user_id").count()
         .withColumn(
@@ -174,7 +188,6 @@ for ch in channels:
     )
     bmap = {r["bucket"]: r["count"] for r in bucket.collect()}
 
-    # Step 4: Top N channels for 2nd & 3rd events
     def top_n(n):
         rows = (
             scoped.filter(col("rn") == n)
@@ -189,7 +202,6 @@ for ch in channels:
     sec_ch, sec_ct = top_n(2)
     thr_ch, thr_ct = top_n(3)
 
-    # Step 5: Append results
     results.append([
         part, ch, total_case, uniq_cust, rep_rate,
         bmap.get("0", 0), bmap.get("1", 0),
