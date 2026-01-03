@@ -13,7 +13,7 @@ part = "202501"
 post_login_values = ["OTP|S", "VB|S", "TPIN|S"]
 
 # ------------------------------------------------------------------------------
-# HDFS FILESYSTEM (FOR PATH CHECK)
+# HDFS FILESYSTEM
 # ------------------------------------------------------------------------------
 hadoop_fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
     spark._jsc.hadoopConfiguration()
@@ -74,20 +74,17 @@ def read_chat(path):
     )
 
 # ------------------------------------------------------------------------------
-# SAFE APPEND (ONLY IF FILE EXISTS)
+# SAFE LOAD
 # ------------------------------------------------------------------------------
 dfs = []
 
-def safe_append(reader_fn, path):
+def safe_append(reader, path):
     if path_exists(path):
-        dfs.append(reader_fn(path))
+        dfs.append(reader(path))
         print(f"[LOAD] {path}")
     else:
-        print(f"[SKIP] {path} (not found)")
+        print(f"[SKIP] {path}")
 
-# ------------------------------------------------------------------------------
-# LOAD DATA
-# ------------------------------------------------------------------------------
 safe_append(read_stacy, f"/user/2030435/CallCentreAnalystics/{mnth}_stacy_en_postlogin.csv")
 safe_append(read_stacy, f"/user/2030435/CallCentreAnalystics/{mnth}_stacy_zh_postlogin.csv")
 safe_append(read_call,  f"/user/2030435/CallCentreAnalystics/{mnth}_call.csv")
@@ -97,22 +94,20 @@ for i in range(1, 5):
     safe_append(read_ivr, f"/user/2030435/CallCentreAnalystics/{mnth}_ivr{i}.csv")
 
 if not dfs:
-    raise Exception("❌ No input files found. Job aborted.")
+    raise Exception("No input files found")
 
-combined_df = (
-    reduce(lambda a, b: a.unionByName(b), dfs)
+combined_df = reduce(lambda a, b: a.unionByName(b), dfs) \
     .dropna(subset=["user_id", "event_ts"])
-)
 
 # ------------------------------------------------------------------------------
-# RANK EVENTS (CACHE ONCE)
+# RANK EVENTS
 # ------------------------------------------------------------------------------
 w = Window.partitionBy("user_id").orderBy("event_ts")
 ranked = combined_df.withColumn("rn", row_number().over(w)).cache()
 ranked.count()
 
 # ------------------------------------------------------------------------------
-# REFERENCE (START) CHANNEL
+# REFERENCE CHANNEL
 # ------------------------------------------------------------------------------
 starters = ranked.filter(col("rn") == 1) \
     .select("user_id", col("event_channel").alias("ref_channel"))
@@ -152,35 +147,35 @@ followup_pivot = (
 )
 
 # ------------------------------------------------------------------------------
-# SECOND & THIRD CONTACT CHANNELS
+# SECOND & THIRD CONTACT CHANNELS (FIXED)
 # ------------------------------------------------------------------------------
 rank_win = Window.partitionBy("ref_channel").orderBy(desc("count"))
 
 def top_contacts(df, rn_value, prefix):
-    return (
+    ranked_contacts = (
         df.filter(col("rn") == rn_value)
           .groupBy("ref_channel", "event_channel")
           .count()
           .withColumn("rnk", row_number().over(rank_win))
           .filter(col("rnk") <= 4)
-          .groupBy("ref_channel")
-          .agg(
-              first(when(col("rnk") == 1, col("event_channel"))).alias(f"{prefix}_1"),
-              first(when(col("rnk") == 2, col("event_channel"))).alias(f"{prefix}_2"),
-              first(when(col("rnk") == 3, col("event_channel"))).alias(f"{prefix}_3"),
-              first(when(col("rnk") == 4, col("event_channel"))).alias(f"{prefix}_4"),
-              first(when(col("rnk") == 1, col("count"))).alias(f"{prefix}_count_1"),
-              first(when(col("rnk") == 2, col("count"))).alias(f"{prefix}_count_2"),
-              first(when(col("rnk") == 3, col("count"))).alias(f"{prefix}_count_3"),
-              first(when(col("rnk") == 4, col("count"))).alias(f"{prefix}_count_4")
-          )
+    )
+
+    return ranked_contacts.groupBy("ref_channel").agg(
+        max(when(col("rnk") == 1, col("event_channel"))).alias(f"{prefix}_1"),
+        max(when(col("rnk") == 2, col("event_channel"))).alias(f"{prefix}_2"),
+        max(when(col("rnk") == 3, col("event_channel"))).alias(f"{prefix}_3"),
+        max(when(col("rnk") == 4, col("event_channel"))).alias(f"{prefix}_4"),
+        max(when(col("rnk") == 1, col("count"))).alias(f"{prefix}_count_1"),
+        max(when(col("rnk") == 2, col("count"))).alias(f"{prefix}_count_2"),
+        max(when(col("rnk") == 3, col("count"))).alias(f"{prefix}_count_3"),
+        max(when(col("rnk") == 4, col("count"))).alias(f"{prefix}_count_4")
     )
 
 second_contacts = top_contacts(scoped, 2, "sec_con_chnl")
 third_contacts  = top_contacts(scoped, 3, "third_con_chnl")
 
 # ------------------------------------------------------------------------------
-# FINAL OUTPUT (EXACT COLUMN ORDER)
+# FINAL OUTPUT
 # ------------------------------------------------------------------------------
 final_df = (
     base_metrics
@@ -199,7 +194,4 @@ final_df = (
     )
 )
 
-# ------------------------------------------------------------------------------
-# SHOW RESULT
-# ------------------------------------------------------------------------------
 final_df.show(truncate=False)
