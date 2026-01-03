@@ -6,7 +6,7 @@ from functools import reduce
 # ------------------------------------------------------------------------------
 # CONFIG
 # ------------------------------------------------------------------------------
-spark = SparkSession.builder.appName("ChannelFlowAnalysis_Option2_Full").getOrCreate()
+spark = SparkSession.builder.appName("ChannelFlowAnalysis_Full_Robust").getOrCreate()
 
 mnth = "jan"
 part = "202501"
@@ -25,18 +25,31 @@ def path_exists(path):
     )
 
 # ------------------------------------------------------------------------------
-# REUSABLE TIMESTAMP PARSER (Option 2)
+# ROBUST TIMESTAMP PARSER
 # ------------------------------------------------------------------------------
 def parse_timestamp(df, ts_col):
-    return df.withColumn(
+    df = df.withColumn(
         "event_ts",
         coalesce(
+            # 24-hour formats with seconds
+            to_timestamp(col(ts_col), "dd-MM-yyyy HH:mm:ss"),
             to_timestamp(col(ts_col), "dd-MM-yyyy HH:mm"),
+            to_timestamp(col(ts_col), "d-M-yyyy HH:mm:ss"),
+            to_timestamp(col(ts_col), "d-M-yyyy HH:mm"),
+            to_timestamp(col(ts_col), "dd-M-yyyy HH:mm:ss"),
+            to_timestamp(col(ts_col), "dd-M-yyyy HH:mm"),
+            to_timestamp(col(ts_col), "d-M-yy HH:mm:ss"),
+            to_timestamp(col(ts_col), "d-M-yy HH:mm"),
+            # 12-hour AM/PM
             to_timestamp(col(ts_col), "d-M-yy hh:mm a"),
             to_timestamp(col(ts_col), "dd-M-yy hh:mm a"),
-            to_timestamp(col(ts_col), "d-MM-yy hh:mm a")
+            to_timestamp(col(ts_col), "d-M-yyyy hh:mm a"),
+            to_timestamp(col(ts_col), "dd-M-yyyy hh:mm a")
         )
     )
+    # optional column to track parse failures
+    df = df.withColumn("parse_failed", when(col("event_ts").isNull(), lit(1)).otherwise(lit(0)))
+    return df
 
 # ------------------------------------------------------------------------------
 # READERS
@@ -46,13 +59,9 @@ def read_stacy(path):
     ts_col = "HKT" if "HKT" in df.columns else "date (UTC)"
     uid_col = "user_id" if "user_id" in df.columns else "customer_id"
 
-    df = df.select(
-        col(uid_col).alias("user_id"),
-        col(ts_col)
-    )
+    df = df.select(col(uid_col).alias("user_id"), col(ts_col))
     df = parse_timestamp(df, ts_col)
-    df = df.withColumn("event_channel", lit("Stacy"))
-    df = df.drop(ts_col)  # drop original column to avoid union issues
+    df = df.withColumn("event_channel", lit("Stacy")).drop(ts_col)
     return df
 
 def read_ivr(path):
@@ -73,8 +82,7 @@ def read_call(path):
 def read_chat(path):
     df = spark.read.csv(path, header=True)
     df = df.filter(col("Pre/Post") == "Postlogin")
-    df = df.select(col("REL ID").alias("user_id"),
-                   concat_ws(" ", col("Date28"), col("StartTime")).alias("chat_ts"))
+    df = df.select(col("REL ID").alias("user_id"), concat_ws(" ", col("Date28"), col("StartTime")).alias("chat_ts"))
     df = parse_timestamp(df, "chat_ts")
     df = df.withColumn("event_channel", lit("Chat")).drop("chat_ts")
     return df
@@ -91,15 +99,15 @@ def safe_append(reader, path):
     else:
         print(f"[SKIP] {path}")
 
-# Stacy files
+# Stacy
 safe_append(read_stacy, f"/user/2030435/CallCentreAnalystics/{mnth}_stacy_en_postlogin.csv")
 safe_append(read_stacy, f"/user/2030435/CallCentreAnalystics/{mnth}_stacy_zh_postlogin.csv")
 
-# IVR files
+# IVR
 for i in range(1, 5):
     safe_append(read_ivr, f"/user/2030435/CallCentreAnalystics/{mnth}_ivr{i}.csv")
 
-# Call & Chat files
+# Call & Chat
 safe_append(read_call, f"/user/2030435/CallCentreAnalystics/{mnth}_call.csv")
 safe_append(read_chat, f"/user/2030435/CallCentreAnalystics/{mnth}_chat.csv")
 
@@ -110,9 +118,15 @@ if not dfs:
 # COMBINE DATA
 # ------------------------------------------------------------------------------
 combined_df = reduce(lambda a, b: a.unionByName(b), dfs)
-combined_df = combined_df.dropna(subset=["user_id", "event_ts"])
-combined_df.cache()
-combined_df.count()  # triggers parsing
+combined_df = combined_df.dropna(subset=["user_id", "event_ts"]).cache()
+combined_df.count()  # trigger parsing
+
+# ------------------------------------------------------------------------------
+# LOG FAILED PARSES
+# ------------------------------------------------------------------------------
+failed_count = combined_df.filter(col("parse_failed") == 1).count()
+if failed_count > 0:
+    print(f"Warning: {failed_count} rows failed timestamp parsing!")
 
 # ------------------------------------------------------------------------------
 # RANK EVENTS
