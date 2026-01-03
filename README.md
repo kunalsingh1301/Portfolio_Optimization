@@ -1,1 +1,32 @@
-TypeError: Column is not iterable Traceback (most recent call last): File "<stdin>", line 87:undefined, in read_stacy File "<stdin>", line 57, in parse_timestamp File "<stdin>", line 48, in normalize_bad_ampm File "/opt/cloudera/parcels/SPARK3-3.3.2.3.3.7191000.10-1-1.p0.66392475/lib/spark3/python/lib/pyspark.zip/pyspark/sql/functions.py", line 3259, in regexp_replace return _invoke_function("regexp_replace", _to_java_column(str), pattern, replacement) File "/opt/cloudera/parcels/SPARK3-3.3.2.3.3.7191000.10-1-1.p0.66392475/lib/spark3/python/lib/pyspark.zip/pyspark/sql/functions.py", line 85, in _invoke_function return Column(jf(*args)) File "/opt/cloudera/parcels/SPARK3-3.3.2.3.3.7191000.10-1-1.p0.66392475/lib/spark3/python/lib/py4j-0.10.9.5-src.zip/py4j/java_gateway.py", line 1313, in __call__ args_command, temp_args = self._build_args(*args) File "/opt/cloudera/parcels/SPARK3-3.3.2.3.3.7191000.10-1-1.p0.66392475/lib/spark3/python/lib/py4j-0.10.9.5-src.zip/py4j/java_gateway.py", line 1277, in _build_args (new_args, temp_args) = self._get_args(args) File "/opt/cloudera/parcels/SPARK3-3.3.2.3.3.7191000.10-1-1.p0.66392475/lib/spark3/python/lib/py4j-0.10.9.5-src.zip/py4j/java_gateway.py", line 1264, in _get_args temp_arg = converter.convert(arg, self.gateway_client) File "/opt/cloudera/parcels/SPARK3-3.3.2.3.3.7191000.10-1-1.p0.66392475/lib/spark3/python/lib/py4j-0.10.9.5-src.zip/py4j/java_collections.py", line 510, in convert for element in object: File "/opt/cloudera/parcels/SPARK3-3.3.2.3.3.7191000.10-1-1.p0.66392475/lib/spark3/python/lib/pyspark.zip/pyspark/sql/column.py", line 560, in __iter__ raise TypeError("Column is not iterable") TypeError: Column is not iterable
+from pyspark.sql.functions import (
+    col, when, regexp_extract, concat, lpad, lit
+)
+
+def normalize_bad_ampm(df, ts_col):
+    """
+    Fix invalid timestamps like:
+    dd-MM-yy HH:mm:ss AM/PM
+    where HH > 12 and AM/PM exists
+    """
+
+    # Extract components
+    df = df.withColumn("day_part", regexp_extract(col(ts_col), r"^(\d{1,2}-\d{1,2}-\d{2,4})", 1))
+    df = df.withColumn("hour_24", regexp_extract(col(ts_col), r"\s(\d{1,2}):", 1).cast("int"))
+    df = df.withColumn("rest_part", regexp_extract(col(ts_col), r"\s\d{1,2}:(\d{2}:\d{2}\s(?:AM|PM))", 1))
+
+    # Build normalized timestamp
+    df = df.withColumn(
+        "_norm_ts",
+        when(
+            (col(ts_col).rlike("AM|PM")) & (col("hour_24") > 12),
+            concat(
+                col("day_part"),
+                lit(" "),
+                lpad((col("hour_24") - 12).cast("string"), 2, "0"),
+                lit(":"),
+                col("rest_part")
+            )
+        ).otherwise(col(ts_col))
+    )
+
+    return df.drop("day_part", "hour_24", "rest_part")
