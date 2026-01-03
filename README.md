@@ -75,6 +75,7 @@ def read_chat(path):
 
 # ---------------- LOAD DATA ----------------
 dfs = []
+
 for cnt in stacy_cnt:
     for auth in stacy_auth:
         p = f"/user/2030435/CallCentreAnalystics/{mnth}_stacy_{cnt}_{auth}login.csv"
@@ -94,7 +95,8 @@ chat_p = f"/user/2030435/CallCentreAnalystics/{mnth}_chat.csv"
 df = safe_read(read_chat, chat_p)
 if df: dfs.append(df)
 
-if not dfs: raise ValueError("No valid data files found!")
+if not dfs: 
+    raise ValueError("No valid data files found!")
 
 combined_df = reduce(lambda a,b: a.unionByName(b), dfs)
 combined_df = combined_df.dropna(subset=["user_id","event_ts"]).repartition("user_id").cache()
@@ -128,20 +130,30 @@ bucket_pivot = bucket_pivot.withColumnRenamed("0","follow_up_0") \
                            .withColumnRenamed("3+","follow_up_3+")
 
 # ---------------- TOP 2ND & 3RD CHANNELS ----------------
-def pivot_top(df_events, rank, prefix):
-    top = df_events.groupBy("starter_channel", "channel").count()
-    pivot = top.groupBy("starter_channel").pivot("channel").sum("count").fillna(0)
-    # rename columns
-    for c in pivot.columns:
-        if c != "starter_channel":
-            pivot = pivot.withColumnRenamed(c, f"{prefix}_chnl_{c}")
-    return pivot
+def pivot_top_channels(df_events, rn, prefix, top_n=4):
+    df_rn = df_events.filter(col("rn")==rn)
+    # get counts per user
+    top_df = df_rn.groupBy("starter_channel", "channel").count()
+    # rank channels per starter_channel
+    w = Window.partitionBy("starter_channel").orderBy(col("count").desc())
+    top_df = top_df.withColumn("rank", row_number().over(w))
+    # only take top_n channels
+    top_df = top_df.filter(col("rank") <= top_n)
+    # create pivoted names
+    pivoted = top_df.groupBy("starter_channel").pivot("rank", list(range(1, top_n+1))).agg(
+        first("channel").alias("chnl"),
+        first("count").alias("count")
+    )
+    # flatten column names
+    for i in range(1, top_n+1):
+        if f"chnl_{i}" in pivoted.columns:
+            pivoted = pivoted.withColumnRenamed(f"chnl_{i}", f"{prefix}_chnl_{i}")
+        if f"count_{i}" in pivoted.columns:
+            pivoted = pivoted.withColumnRenamed(f"count_{i}", f"{prefix}_chnl_count_{i}")
+    return pivoted
 
-df2 = df.filter(col("rn")==2)
-df3 = df.filter(col("rn")==3)
-
-top2_pivot = pivot_top(df2, 2, "sec_con")
-top3_pivot = pivot_top(df3, 3, "third_con")
+top2_pivot = pivot_top_channels(df, 2, "sec")
+top3_pivot = pivot_top_channels(df, 3, "third")
 
 # ---------------- FINAL OUTPUT ----------------
 final_df = agg_df.join(bucket_pivot, "starter_channel", "left") \
@@ -150,11 +162,24 @@ final_df = agg_df.join(bucket_pivot, "starter_channel", "left") \
                  .withColumnRenamed("starter_channel","Channel") \
                  .withColumn("Date", lit(part))
 
-# ---------------- REORDER COLUMNS ----------------
-cols = ["Date","Channel","total_case","uniq_cust","rep_rate",
-        "follow_up_0","follow_up_1","follow_up_2","follow_up_3+"]
-# Add top2 and top3 columns dynamically
-cols += [c for c in top2_pivot.columns if c!="starter_channel"]
-cols += [c for c in top3_pivot.columns if c!="starter_channel"]
+# ---------------- FIX SCHEMA ----------------
+columns = [
+    "Date", "Channel", "total_case", "uniq_cust", "rep_rate",
+    "follow_up_0", "follow_up_1", "follow_up_2", "follow_up_3+",
+    "sec_chnl_1", "sec_chnl_2", "sec_chnl_3", "sec_chnl_4",
+    "sec_chnl_count_1", "sec_chnl_count_2", "sec_chnl_count_3", "sec_chnl_count_4",
+    "third_chnl_1", "third_chnl_2", "third_chnl_3", "third_chnl_4",
+    "third_chnl_count_1", "third_chnl_count_2", "third_chnl_count_3", "third_chnl_count_4"
+]
 
-final_df.select(cols).show(truncate=False)
+# fill missing columns with null
+from pyspark.sql import functions as F
+for c in columns:
+    if c not in final_df.columns:
+        final_df = final_df.withColumn(c, F.lit(None))
+
+# reorder columns
+final_df = final_df.select(columns)
+
+# ---------------- SHOW OUTPUT ----------------
+final_df.show(truncate=False)
