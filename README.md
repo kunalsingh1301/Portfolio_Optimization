@@ -1,215 +1,247 @@
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import *
-from pyspark.sql.window import Window
-from functools import reduce
+# Channel Flow Analysis Pipeline
 
-# ---------------- SPARK SESSION ----------------
-spark = SparkSession.builder.appName("ChannelFlowNormalized").getOrCreate()
-spark.conf.set("spark.sql.legacy.timeParserPolicy", "LEGACY")
+## Overview
 
-# ---------------- CONFIG ----------------
-mnth = "jan"
-part = "202501"
+This project implements a **robust PySpark pipeline** to analyze customer interaction flows across multiple service channels (Stacy, IVR, Call, Chat). It is designed to handle **messy real-world data**, ensure correctness of metrics like repetition rate, and produce a **fixed reporting schema** suitable for downstream analytics or business reporting.
 
-stacy_cnt = ["en", "zh"]
-stacy_auth = ["post"]
-post_login_values = ["OTP|S", "VB|S", "TPIN|S"]
+The pipeline is optimized for **Spark 3.x**, runs reliably in **Hue**, and gracefully handles missing or malformed files.
 
-# ---------------- HDFS HELPERS ----------------
-hadoop_fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
-    spark._jsc.hadoopConfiguration()
-)
-def path_exists(p):
-    return hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(p))
+---
 
-# ---------------- TIMESTAMP NORMALIZER ----------------
-def normalize_timestamp(df, ts_col):
-    df = df.withColumn("_ts", trim(col(ts_col)))
+## Business Objective
 
-    df = df.withColumn(
-        "_ts",
-        when(col("_ts").rlike(r"^\d{1,2}-\d{1,2}-\d{2,4} \d{1,2}:\d{2}$"),
-             concat(col("_ts"), lit(":00")))
-        .otherwise(col("_ts"))
-    )
+Answer the following questions **per starter channel**:
 
-    formats = [
-        "d-M-yy HH:mm:ss", "d-M-yy hh:mm:ss a",
-        "d-M-yyyy HH:mm:ss", "d-M-yyyy hh:mm:ss a",
-        "d-M-yy HH:mm", "d-M-yy hh:mm a",
-        "d-M-yyyy HH:mm", "d-M-yyyy hh:mm a"
-    ]
+1. How many total interactions occurred?
+2. How many unique customers interacted?
+3. What percentage of interactions are repeats?
+4. How many users came back 0, 1, 2, or 3+ times?
+5. What are the most common **2nd** and **3rd** channels users move to?
 
-    df = df.withColumn(
-        "event_ts",
-        coalesce(*[to_timestamp(col("_ts"), f) for f in formats])
-    )
+---
 
-    return df.drop("_ts")
+## Input Data Sources
 
-# ---------------- SAFE READER ----------------
-def safe_read(func, path):
-    try:
-        if path_exists(path):
-            df = func(path)
-            if df is not None and not df.rdd.isEmpty():
-                return df
-    except:
-        pass
-    return None
+| Source | Description                  | Key Columns                             |
+| ------ | ---------------------------- | --------------------------------------- |
+| Stacy  | App / Web interactions       | user_id / customer_id, HKT / date (UTC) |
+| IVR    | IVR post-login flows         | REL_ID, STARTTIME                       |
+| Call   | Call center interactions     | Customer No (CTI), Call Start Time      |
+| Chat   | Chat post-login interactions | REL ID, Date28, StartTime               |
 
-# ---------------- DATA READERS ----------------
-def read_stacy(path):
-    df = spark.read.option("header", True).csv(path)
-    ts_col = "HKT" if "HKT" in df.columns else "date (UTC)"
-    user_col = "user_id" if "user_id" in df.columns else "customer_id"
-    df = normalize_timestamp(df, ts_col)
-    return df.select(col(user_col).alias("user_id"),
-                     "event_ts",
-                     lit("Stacy").alias("channel"))
+⚠️ Data issues handled:
 
-def read_ivr(path):
-    df = spark.read.option("header", True).csv(path)
-    df = df.filter(col("ONE_FA").isin(post_login_values))
-    df = normalize_timestamp(df, "STARTTIME")
-    return df.select(col("REL_ID").alias("user_id"),
-                     "event_ts",
-                     lit("IVR").alias("channel"))
+* Day/month may be 1 or 2 digits
+* Year may be 2 or 4 digits
+* Time may be 24-hour with AM/PM
+* Missing seconds
+* Missing monthly files
 
-def read_call(path):
-    df = spark.read.option("header", True).csv(path)
-    df = normalize_timestamp(df, "Call Start Time")
-    return df.select(col("Customer No (CTI)").alias("user_id"),
-                     "event_ts",
-                     lit("Call").alias("channel"))
+---
 
-def read_chat(path):
-    df = spark.read.option("header", True).csv(path)
-    df = df.filter(col("Pre/Post") == "Postlogin")
-    df = df.withColumn("_ts", concat_ws(" ", col("Date28"), col("StartTime")))
-    df = normalize_timestamp(df, "_ts")
-    return df.select(col("REL ID").alias("user_id"),
-                     "event_ts",
-                     lit("Chat").alias("channel"))
+## Output Schema
 
-# ---------------- LOAD DATA ----------------
-dfs = []
+```text
+Date
+Channel
+ total_case
+ uniq_cust
+ rep_rate
+ follow_up_0
+ follow_up_1
+ follow_up_2
+ follow_up_3+
+ sec_chnl_1
+ sec_chnl_2
+ sec_chnl_3
+ sec_chnl_4
+ sec_chnl_count_1
+ sec_chnl_count_2
+ sec_chnl_count_3
+ sec_chnl_count_4
+ third_chnl_1
+ third_chnl_2
+ third_chnl_3
+ third_chnl_4
+ third_chnl_count_1
+ third_chnl_count_2
+ third_chnl_count_3
+ third_chnl_count_4
+```
 
-for cnt in stacy_cnt:
-    for auth in stacy_auth:
-        p = f"/user/2030435/CallCentreAnalystics/{mnth}_stacy_{cnt}_{auth}login.csv"
-        df = safe_read(read_stacy, p)
-        if df: dfs.append(df)
+---
 
-for i in range(1, 5):
-    p = f"/user/2030435/CallCentreAnalystics/{mnth}_ivr{i}.csv"
-    df = safe_read(read_ivr, p)
-    if df: dfs.append(df)
+## High-Level Architecture
 
-df = safe_read(read_call, f"/user/2030435/CallCentreAnalystics/{mnth}_call.csv")
-if df: dfs.append(df)
+```
+            +-------------+
+            |  Stacy CSV  |
+            +-------------+
+                   |
+            +-------------+
+            |   IVR CSV   |
+            +-------------+       +-------------------+
+                   |               | Timestamp         |
+            +-------------+ -----> | Normalization     |
+            |  Call CSV   |       +-------------------+
+                   |
+            +-------------+
+            |  Chat CSV   |
+            +-------------+
+                   |
+                   v
+        +-------------------------+
+        | Unified Event Table     |
+        | (user_id, event_ts,     |
+        |  channel)               |
+        +-------------------------+
+                   |
+                   v
+        +-------------------------+
+        | Window Function         |
+        | row_number() per user   |
+        +-------------------------+
+                   |
+                   v
+        +-------------------------+
+        | Starter Channel Logic   |
+        +-------------------------+
+                   |
+                   v
+        +-------------------------+
+        | Aggregations & Ranking  |
+        +-------------------------+
+                   |
+                   v
+        +-------------------------+
+        | Final Report Output     |
+        +-------------------------+
+```
 
-df = safe_read(read_chat, f"/user/2030435/CallCentreAnalystics/{mnth}_chat.csv")
-if df: dfs.append(df)
+---
 
-if not dfs:
-    raise ValueError("No data found")
+## Data Lineage (Detailed)
 
-combined_df = reduce(lambda a, b: a.unionByName(b), dfs) \
-    .dropna(subset=["user_id", "event_ts"]) \
-    .repartition("user_id") \
-    .cache()
+### Event-Level Lineage
 
-# ---------------- RN + STARTER CHANNEL ----------------
-w = Window.partitionBy("user_id").orderBy("event_ts")
+```
+Raw CSV
+  |
+  |-- read_*()
+  |
+Normalized Timestamp
+  |
+  |-- normalize_timestamp()
+  |
+(user_id, event_ts, channel)
+  |
+  |-- unionByName()
+  |
+Combined Event Table
+  |
+  |-- repartition(user_id)
+  |-- row_number() OVER (user_id ORDER BY event_ts)
+  |
+Ranked Events
+```
 
-df = combined_df.withColumn("rn", row_number().over(w))
+### Aggregation Lineage
 
-starter_df = df.filter(col("rn") == 1) \
-               .select("user_id", col("channel").alias("starter_channel"))
+```
+Ranked Events
+  |
+  |-- rn = 1  --> Starter Channel
+  |
+  |-- groupBy(starter_channel)
+  |        |-- total_case
+  |        |-- uniq_cust
+  |        |-- rep_rate
+  |
+  |-- groupBy(starter_channel, user_id)
+  |        |-- follow_up buckets
+  |
+  |-- rn = 2 / rn = 3
+           |-- top-N ranking per starter channel
+```
 
-df = df.join(starter_df, "user_id")
+---
 
-# ---------------- TOTAL + REP RATE ----------------
-agg_df = df.groupBy("starter_channel").agg(
-    count("*").alias("total_case"),
-    countDistinct("user_id").alias("uniq_cust")
-).withColumn(
-    "rep_rate",
-    (col("total_case") - col("uniq_cust")) * 100 / col("total_case")
-)
+## Key Design Decisions
 
-# ---------------- FOLLOW-UP BUCKETS ----------------
-follow_df = df.groupBy("starter_channel", "user_id").count()
+### 1. Lazy Evaluation
 
-bucket_df = follow_df.withColumn(
-    "bucket",
-    when(col("count") == 1, "0")
-    .when(col("count") == 2, "1")
-    .when(col("count") == 3, "2")
-    .otherwise("3+")
-)
+All transformations (`select`, `withColumn`, `groupBy`) are **lazy**. Spark only executes when an action like `.show()` or `.count()` is called.
 
-bucket_pivot = (
-    bucket_df.groupBy("starter_channel", "bucket")
-    .count()
-    .groupBy("starter_channel")
-    .pivot("bucket", ["0", "1", "2", "3+"])
-    .sum("count")
-    .fillna(0)
-    .withColumnRenamed("0", "follow_up_0")
-    .withColumnRenamed("1", "follow_up_1")
-    .withColumnRenamed("2", "follow_up_2")
-    .withColumnRenamed("3+", "follow_up_3+")
-)
+### 2. No UDFs
 
-# ---------------- TOP 2nd / 3rd CONTACT (FIXED) ----------------
-def top_contact(df, rn, prefix, top_n=4):
-    base = df.filter(col("rn") == rn) \
-             .groupBy("starter_channel", "channel") \
-             .count()
+Built-in Spark functions are used exclusively for:
 
-    w = Window.partitionBy("starter_channel").orderBy(col("count").desc())
-    ranked = base.withColumn("rank", row_number().over(w)) \
-                 .filter(col("rank") <= top_n)
+* Performance
+* Catalyst optimization
+* JVM-level execution
 
-    exprs = []
-    for i in range(1, top_n + 1):
-        exprs += [
-            max(when(col("rank") == i, col("channel"))).alias(f"{prefix}_chnl_{i}"),
-            max(when(col("rank") == i, col("count"))).alias(f"{prefix}_chnl_count_{i}")
-        ]
+### 3. Window Functions
 
-    return ranked.groupBy("starter_channel").agg(*exprs)
+`row_number()` is used to:
 
-sec_df = top_contact(df, 2, "sec")
-third_df = top_contact(df, 3, "third")
+* Identify starter channel
+* Identify 2nd and 3rd interactions
 
-# ---------------- FINAL JOIN ----------------
-final_df = (
-    agg_df
-    .join(bucket_pivot, "starter_channel", "left")
-    .join(sec_df, "starter_channel", "left")
-    .join(third_df, "starter_channel", "left")
-    .withColumnRenamed("starter_channel", "Channel")
-    .withColumn("Date", lit(part))
-)
+This avoids expensive self-joins.
 
-# ---------------- FIX OUTPUT SCHEMA ----------------
-columns = [
-    "Date", "Channel", "total_case", "uniq_cust", "rep_rate",
-    "follow_up_0", "follow_up_1", "follow_up_2", "follow_up_3+",
-    "sec_chnl_1", "sec_chnl_2", "sec_chnl_3", "sec_chnl_4",
-    "sec_chnl_count_1", "sec_chnl_count_2", "sec_chnl_count_3", "sec_chnl_count_4",
-    "third_chnl_1", "third_chnl_2", "third_chnl_3", "third_chnl_4",
-    "third_chnl_count_1", "third_chnl_count_2", "third_chnl_count_3", "third_chnl_count_4"
-]
+### 4. Defensive File Handling
 
-for c in columns:
-    if c not in final_df.columns:
-        final_df = final_df.withColumn(c, lit(None))
+* HDFS path existence checks
+* Safe reads with try/except
+* Empty DataFrames skipped gracefully
 
-final_df = final_df.select(columns)
+### 5. Fixed Output Schema
 
-# ---------------- SHOW RESULT ----------------
-final_df.show(truncate=False)
+Final output is explicitly ordered and filtered to ensure **stable downstream consumption**, even if some channels are missing in a month.
+
+---
+
+## Performance Considerations
+
+| Optimization         | Reason                   |
+| -------------------- | ------------------------ |
+| repartition(user_id) | Reduces window shuffle   |
+| cache()              | Reused multiple times    |
+| No collect() loops   | Avoids driver bottleneck |
+| Top-N via window     | Distributed ranking      |
+
+---
+
+## Failure Scenarios & Handling
+
+| Issue             | Handling                    |
+| ----------------- | --------------------------- |
+| Missing CSV       | Skipped safely              |
+| Invalid timestamp | Parsed via fallback formats |
+| Empty REL_ID      | Dropped via `dropna`        |
+| Schema mismatch   | Column normalization        |
+
+---
+
+## When to Modify This Pipeline
+
+* Add new channel → implement new `read_*()` function
+* New timestamp format → add to `formats` list
+* Different follow-up logic → update bucket mapping
+* New ranking depth → adjust `rn` filter
+
+---
+
+## Summary
+
+This pipeline is **production-grade**, scalable, and resilient to real-world data issues. It applies best practices from:
+
+* Distributed systems
+* Data engineering
+* Spark performance tuning
+
+It is suitable for **monthly batch reporting**, ad-hoc analysis, and long-term maintenance.
+
+---
+
+*Author: Internal Analytics Engineering*
