@@ -7,19 +7,24 @@ from pyspark.sql.functions import (
 def normalize_timestamp(df, ts_col):
 
     # -------------------------------------------------
-    # 1. Raw string
+    # 1. Raw string (normalize whitespace)
     # -------------------------------------------------
-    df = df.withColumn("_raw_ts", trim(col(ts_col)))
+    df = df.withColumn(
+        "_raw_ts",
+        trim(regexp_replace(col(ts_col), r"\s+", " "))
+    )
 
     # -------------------------------------------------
-    # 2. Normalize Excel numeric strings
-    #    "45926 0.7653" -> "45926.7653"
+    # 2. Normalize Excel numeric string
+    #    Handles:
+    #    45926 0.7653
+    #    45926   0.7653
     # -------------------------------------------------
     df = df.withColumn(
         "_excel_str",
         when(
             col("_raw_ts").rlike(r"^\d+\s+\d+(\.\d+)?$"),
-            regexp_replace(col("_raw_ts"), r"\s+", ".")
+            regexp_replace(col("_raw_ts"), r" ", ".")
         ).when(
             col("_raw_ts").rlike(r"^\d+(\.\d+)?$"),
             col("_raw_ts")
@@ -27,15 +32,18 @@ def normalize_timestamp(df, ts_col):
     )
 
     # -------------------------------------------------
-    # 3. Convert Excel string -> DOUBLE
+    # 3. SAFELY cast to double
     # -------------------------------------------------
     df = df.withColumn(
         "_excel_double",
-        col("_excel_str").cast("double")
+        when(
+            col("_excel_str").rlike(r"^\d+(\.\d+)?$"),
+            col("_excel_str").cast("double")
+        )
     )
 
     # -------------------------------------------------
-    # 4. Excel DOUBLE -> timestamp
+    # 4. Excel double → timestamp
     # -------------------------------------------------
     df = df.withColumn(
         "_excel_ts",
@@ -49,7 +57,7 @@ def normalize_timestamp(df, ts_col):
     )
 
     # -------------------------------------------------
-    # 5. String timestamp parsing
+    # 5. String timestamp formats
     # -------------------------------------------------
     formats = [
         "d-M-yy HH:mm:ss", "d-M-yy hh:mm:ss a",
