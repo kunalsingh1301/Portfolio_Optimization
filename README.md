@@ -8,63 +8,134 @@ spark = SparkSession.builder.appName("xxxx").enableHiveSupport().getOrCreate()
 spark.conf.set("spark.sql.legacy.timeParserPolicy", "LEGACY")
 
 # ---------------- CONFIG ----------------
-month_part_mapping = {
-    "jan": "202501",
-    "feb": "202502",
-    "mar": "202503",
-    "apr": "202504",
-    "may": "202505",
-    "jun": "202506",
-    "jul": "202507",
-    "aug": "202508",
-    "sep": "202509",
-    "oct": "202510",
-    "nov": "202511",
-}
+mnth = "nov"
+part = "202510"
 
 stacy_cnt = ["en", "zh"]
 stacy_auth = ["post"]
 post_login_values = ["OTP|S", "VB|S", "TPIN|S"]
 
 # ---------------- HDFS HELPERS ----------------
-hadoop_fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
+hadoop_fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
+    spark._jsc.hadoopConfiguration()
+)
 def path_exists(p):
     return hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(p))
 
-# ---------------- NORMALIZE TIMESTAMP ----------------
+# ---------------- TIMESTAMP NORMALIZER ----------------
+
 def normalize_timestamp(df, ts_col):
-    # Use the full normalize_timestamp code from your last working version
-    # including Excel handling, dash/slash dates, AM/PM, etc.
-    # ...
-    # (paste your latest normalize_timestamp function here)
-    return df  # placeholder
 
-# ---------------- DATA READERS ----------------
-def read_stacy(path):
-    df = spark.read.option("header", True).csv(path)
-    ts_col = "HKT" if "HKT" in df.columns else "date (UTC)"
-    user_col = "user_id" if "user_id" in df.columns else "customer_id"
-    df = normalize_timestamp(df, ts_col)
-    return df.select(col(user_col).alias("user_id"), "event_ts", lit("Stacy").alias("channel"))
+    # -------------------------------------------------
+    # 1. Raw trimmed string
+    # -------------------------------------------------
+    df = df.withColumn("_raw_ts", trim(col(ts_col)))
+    #df.select("_raw_ts").show()
 
-def read_ivr(path):
-    df = spark.read.option("header", True).csv(path)
-    df = df.filter(col("ONE_FA").isin(post_login_values))
-    df = normalize_timestamp(df, "STARTTIME")
-    return df.select(col("REL_ID").alias("user_id"), "event_ts", lit("IVR").alias("channel"))
+    # -------------------------------------------------
+    # 2. Detect Excel split numeric
+    #    "45925 0.8766"
+    # -------------------------------------------------
+    df = df.withColumn(
+        "_excel_days",
+        when(
+            col("_raw_ts").rlike(r"^\d+\s+\d*\.\d+$"),
+            split(col("_raw_ts"), r"\s+")[0].cast("double")
+        )
+    )
+    #df.select("_excel_days").show()
 
-def read_call(path):
-    df = spark.read.option("header", True).csv(path)
-    df = normalize_timestamp(df, "Call Start Time")
-    return df.select(col("Customer No (CTI)").alias("user_id"), "event_ts", lit("Call").alias("channel"))
+    df = df.withColumn(
+        "_excel_fraction",
+        when(
+            col("_raw_ts").rlike(r"^\d+\s+\d*\.\d+$"),
+            split(col("_raw_ts"), r"\s+")[1].cast("double")
+        )
+    )
+    #df.select("_excel_fraction").show()
+    #df.printSchema()
 
-def read_chat(path):
-    df = spark.read.option("header", True).csv(path)
-    df = df.filter(col("Pre/Post") == "Postlogin")
-    df = df.withColumn("_ts", concat_ws(" ", col("Date7"), col("StartTime")))
-    df = normalize_timestamp(df, "_ts")
-    return df.select(col("REL ID").alias("user_id"), "event_ts", lit("Chat").alias("channel"))
+    # -------------------------------------------------
+    # 3. Build Excel numeric value CORRECTLY
+    # -------------------------------------------------
+    df = df.withColumn(
+        "_excel_value",
+        when(
+            col("_excel_days").isNotNull(),
+            col("_excel_days") + col("_excel_fraction")
+        )
+    )
+    #df.select("_excel_value").show()
 
+    # -------------------------------------------------
+    # 4. Excel numeric → timestamp
+    # -------------------------------------------------
+    df = df.withColumn(
+        "_excel_ts",
+        when(
+            col("_excel_value").isNotNull(),
+            expr("timestampadd(SECOND,cast((_excel_value-25569)*86400 as int),"
+              "timestamp('1970-01-01'))"
+              )
+        )
+    )
+
+    # -------------------------------------------------
+    # 5. Normal string timestamps
+    # -------------------------------------------------
+    formats = [
+        "d-M-yy HH:mm:ss", "d-M-yy hh:mm:ss a",
+        "d-M-yyyy HH:mm:ss", "d-M-yyyy hh:mm:ss a",
+        "d-M-yy HH:mm", "d-M-yy hh:mm a",
+        "d-M-yyyy HH:mm", "d-M-yyyy hh:mm a",
+
+        "M-d-yy HH:mm:ss", "M-d-yyyy HH:mm:ss",
+        "M-d-yy HH:mm", "M-d-yyyy HH:mm",
+        "M-d-yy HH:mm:ss a", "M-d-yyyy HH:mm:ss a",
+        "M-d-yy HH:mm a", "M-d-yyyy HH:mm a",
+        
+        # slash-separated with time (AM/PM)
+        "dd/MM/yyyy hh:mm a",
+        "dd/MM/yyyy hh:mm:ss a",
+        "dd/MM/yy hh:mm a",
+        "dd/MM/yy hh:mm:ss a",
+        "M/d/yy hh:mm a",
+        "MM/dd/yy hh:mm a",
+        "M/d/yyyy hh:mm a",
+        "MM/dd/yyyy hh:mm a",
+        "M/d/yy hh:mm:ss a",
+        "MM/dd/yy hh:mm:ss a",
+        "M/d/yyyy hh:mm:ss a",
+        "MM/dd/yyyy hh:mm:ss a",
+
+        # slash-separated without time
+        "M/d/yy", "MM/dd/yy", "M/d/yyyy", "MM/dd/yyyy"
+
+    ]
+
+    df = df.withColumn(
+        "_string_ts",
+        coalesce(*[to_timestamp(col("_raw_ts"), f) for f in formats])
+    )
+
+    # -------------------------------------------------
+    # 6. FINAL event_ts
+    # -------------------------------------------------
+    df = df.withColumn(
+        "event_ts",
+        when(col("_excel_ts").isNotNull(), col("_excel_ts"))
+        .otherwise(col("_string_ts"))
+    )
+
+    return df.drop(
+        "_raw_ts", "_excel_days", "_excel_fraction",
+        "_excel_value", "_excel_ts", "_string_ts"
+    )
+
+
+
+
+# ---------------- SAFE READER ----------------
 def safe_read(func, path):
     try:
         if path_exists(path):
@@ -72,129 +143,186 @@ def safe_read(func, path):
             if df is not None and not df.rdd.isEmpty():
                 return df
         else:
-            print(path + " doesn't exist")
-    except Exception as e:
-        print(f"Error reading {path}: {e}")
+          print(path + "doesn't exist")
+    except:
+        pass
     return None
 
-# ---------------- RUN PIPELINE FOR ALL MONTHS ----------------
-all_months_df = []
+# ---------------- DATA READERS ----------------
+def read_stacy(path):
+    df = spark.read.option("header", True).csv(path)
+    ts_col = "HKT" if "HKT" in df.columns else "date (UTC)"
+    user_col = "user_id" if "user_id" in df.columns else "customer_id"
+    df = normalize_timestamp(df, ts_col)
+    return df.select(col(user_col).alias("user_id"),
+                     "event_ts",
+                     lit("Stacy").alias("channel"))
 
-for mnth, part in month_part_mapping.items():
-    print(f"\n=== Processing {mnth.upper()} ({part}) ===")
-    dfs = []
+def read_ivr(path):
+    df = spark.read.option("header", True).csv(path)
+    df = df.filter(col("ONE_FA").isin(post_login_values))
+    df = normalize_timestamp(df, "STARTTIME")
+    return df.select(col("REL_ID").alias("user_id"),
+                     "event_ts",
+                     lit("IVR").alias("channel"))
 
-    # Stacy
-    for cnt in stacy_cnt:
-        for auth in stacy_auth:
-            p = f"/user/2030435/CallCentreAnalystics/{mnth}_stacy_{cnt}_{auth}login.csv"
-            df = safe_read(read_stacy, p)
-            if df: dfs.append(df)
+def read_call(path):
+    df = spark.read.option("header", True).csv(path)
+    #print("Call")
+    #df.select("Call Start Time").show()
+    df = normalize_timestamp(df, "Call Start Time")
+    #df.select("event_ts").show()
+    return df.select(col("Customer No (CTI)").alias("user_id"),
+                     "event_ts",
+                     lit("Call").alias("channel"))
 
-    # IVR
-    for i in range(1, 5):
-        p = f"/user/2030435/CallCentreAnalystics/{mnth}_ivr{i}.csv"
-        df = safe_read(read_ivr, p)
+def read_chat(path):
+    df = spark.read.option("header", True).csv(path)
+    df = df.filter(col("Pre/Post") == "Postlogin")
+    df = df.withColumn("_ts", concat_ws(" ", col("Date7"), col("StartTime")))
+    #df.select(
+    #    col("_ts").alias("raw_ts"),
+    #    hex(col("_ts")).alias("raw_hex"),
+    #    length(col("_ts")).alias("raw_len"),
+    #    trim(col("_ts")).alias("trimmed"),
+    #    regexp_replace(col("_ts"), r"\s+", " ").alias("ws_normalized"),
+    #    regexp_replace(col("_ts"), r"\s+", ".").alias("space_to_dot"),
+    #    col("_ts").rlike(r"^\d+\s+\d+(\.\d+)?$").alias("is_excel_split"),
+    #    col("_ts").rlike(r"^\d+(\.\d+)?$").alias("is_excel_plain"),
+    #    regexp_replace(col("_ts"), r"\s+", ".").cast("double").alias("as_double")
+    #).show(50, False)
+
+    #df.printSchema()
+    df.select("_ts","Date7","StartTime").show()
+    
+    df = normalize_timestamp(df, "_ts")
+    #df.printSchema()
+    #df.select("event_ts").show(50)
+    return df.select(col("REL ID").alias("user_id"),
+                     "event_ts",
+                     lit("Chat").alias("channel"))
+
+# ---------------- LOAD DATA ----------------
+dfs = []
+
+for cnt in stacy_cnt:
+    for auth in stacy_auth:
+        p = f"/user/2030435/CallCentreAnalystics/{mnth}_stacy_{cnt}_{auth}login.csv"
+        df = safe_read(read_stacy, p)
         if df: dfs.append(df)
 
-    # Call
-    p = f"/user/2030435/CallCentreAnalystics/{mnth}_call.csv"
-    df = safe_read(read_call, p)
+for i in range(1, 5):
+    p = f"/user/2030435/CallCentreAnalystics/{mnth}_ivr{i}.csv"
+    df = safe_read(read_ivr, p)
     if df: dfs.append(df)
 
-    # Chat
-    p = f"/user/2030435/CallCentreAnalystics/{mnth}_chat.csv"
-    df = safe_read(read_chat, p)
-    if df: dfs.append(df)
+df = safe_read(read_call, f"/user/2030435/CallCentreAnalystics/{mnth}_call.csv")
+if df: dfs.append(df)
 
-    if not dfs:
-        print(f"No data found for {mnth}")
-        continue
+df = safe_read(read_chat, f"/user/2030435/CallCentreAnalystics/{mnth}_chat.csv")
+if df: dfs.append(df)
 
-    combined_df = reduce(lambda a, b: a.unionByName(b), dfs) \
-        .dropna(subset=["user_id", "event_ts"]) \
-        .repartition("user_id") \
-        .cache()
+if not dfs:
+    raise ValueError("No data found")
 
-    # ---------------- RN + STARTER CHANNEL ----------------
-    w = Window.partitionBy("user_id").orderBy("event_ts")
-    df_rn = combined_df.withColumn("rn", row_number().over(w))
-    starter_df = df_rn.filter(col("rn") == 1).select("user_id", col("channel").alias("starter_channel"))
-    df_rn = df_rn.join(starter_df, "user_id")
+combined_df = reduce(lambda a, b: a.unionByName(b), dfs) \
+    .dropna(subset=["user_id", "event_ts"]) \
+    .repartition("user_id") \
+    .cache()
+#combined_df.groupBy("channel").count().show()
 
-    # ---------------- TOTAL + REP RATE ----------------
-    agg_df = df_rn.groupBy("starter_channel").agg(
-        count("*").alias("total_case"),
-        countDistinct("user_id").alias("uniq_cust")
-    ).withColumn("rep_rate", (col("total_case") - col("uniq_cust")) * 100 / col("total_case"))
+# ---------------- RN + STARTER CHANNEL ----------------
+w = Window.partitionBy("user_id").orderBy("event_ts")
 
-    # ---------------- FOLLOW-UP BUCKETS ----------------
-    follow_df = df_rn.groupBy("starter_channel", "user_id").count()
-    bucket_df = follow_df.withColumn(
-        "bucket",
-        when(col("count") == 1, "0")
-        .when(col("count") == 2, "1")
-        .when(col("count") == 3, "2")
-        .otherwise("3+")
-    )
-    bucket_pivot = (
-        bucket_df.groupBy("starter_channel", "bucket")
-        .count()
-        .groupBy("starter_channel")
-        .pivot("bucket", ["0","1","2","3+"])
-        .sum("count")
-        .fillna(0)
-        .withColumnRenamed("0","follow_up_0")
-        .withColumnRenamed("1","follow_up_1")
-        .withColumnRenamed("2","follow_up_2")
-        .withColumnRenamed("3+","follow_up_3+")
-    )
+df = combined_df.withColumn("rn", row_number().over(w))
 
-    # ---------------- TOP 2ND / 3RD CONTACT ----------------
-    def top_contact(df, rn, prefix, top_n=4):
-        base = df.filter(col("rn") == rn).groupBy("starter_channel", "channel").count()
-        w = Window.partitionBy("starter_channel").orderBy(col("count").desc())
-        ranked = base.withColumn("rank", row_number().over(w)).filter(col("rank") <= top_n)
-        exprs = []
-        for i in range(1, top_n+1):
-            exprs += [
-                max(when(col("rank") == i, col("channel"))).alias(f"{prefix}_chnl_{i}"),
-                max(when(col("rank") == i, col("count"))).alias(f"{prefix}_chnl_count_{i}")
-            ]
-        return ranked.groupBy("starter_channel").agg(*exprs)
+starter_df = df.filter(col("rn") == 1) \
+               .select("user_id", col("channel").alias("starter_channel"))
 
-    sec_df = top_contact(df_rn, 2, "sec")
-    third_df = top_contact(df_rn, 3, "third")
+df = df.join(starter_df, "user_id")
 
-    # ---------------- FINAL JOIN ----------------
-    final_df = (
-        agg_df
-        .join(bucket_pivot, "starter_channel", "left")
-        .join(sec_df, "starter_channel", "left")
-        .join(third_df, "starter_channel", "left")
-        .withColumnRenamed("starter_channel","Channel")
-        .withColumn("Date", lit(part))
-    )
+#df.filter(col("rn")==1).groupBy("channel").count().show()
 
-    # ---------------- FIX SCHEMA ----------------
-    columns = [
-        "Date","Channel","total_case","uniq_cust","rep_rate",
-        "follow_up_0","follow_up_1","follow_up_2","follow_up_3+",
-        "sec_chnl_1","sec_chnl_2","sec_chnl_3","sec_chnl_4",
-        "sec_chnl_count_1","sec_chnl_count_2","sec_chnl_count_3","sec_chnl_count_4",
-        "third_chnl_1","third_chnl_2","third_chnl_3","third_chnl_4",
-        "third_chnl_count_1","third_chnl_count_2","third_chnl_count_3","third_chnl_count_4"
-    ]
-    for c in columns:
-        if c not in final_df.columns:
-            final_df = final_df.withColumn(c, lit(None))
-    final_df = final_df.select(columns)
+# ---------------- TOTAL + REP RATE ----------------
+agg_df = df.groupBy("starter_channel").agg(
+    count("*").alias("total_case"),
+    countDistinct("user_id").alias("uniq_cust")
+).withColumn(
+    "rep_rate",
+    (col("total_case") - col("uniq_cust")) * 100 / col("total_case")
+)
 
-    all_months_df.append(final_df)
+# ---------------- FOLLOW-UP BUCKETS ----------------
+follow_df = df.groupBy("starter_channel", "user_id").count()
 
-# ---------------- UNION ALL MONTHS ----------------
-if all_months_df:
-    result_df = reduce(lambda a,b: a.unionByName(b), all_months_df)
-    result_df.show(truncate=False)
-else:
-    print("No data found for any month.")
+bucket_df = follow_df.withColumn(
+    "bucket",
+    when(col("count") == 1, "0")
+    .when(col("count") == 2, "1")
+    .when(col("count") == 3, "2")
+    .otherwise("3+")
+)
+
+bucket_pivot = (
+    bucket_df.groupBy("starter_channel", "bucket")
+    .count()
+    .groupBy("starter_channel")
+    .pivot("bucket", ["0", "1", "2", "3+"])
+    .sum("count")
+    .fillna(0)
+    .withColumnRenamed("0", "follow_up_0")
+    .withColumnRenamed("1", "follow_up_1")
+    .withColumnRenamed("2", "follow_up_2")
+    .withColumnRenamed("3+", "follow_up_3+")
+)
+
+# ---------------- TOP 2nd / 3rd CONTACT (FIXED) ----------------
+def top_contact(df, rn, prefix, top_n=4):
+    base = df.filter(col("rn") == rn) \
+             .groupBy("starter_channel", "channel") \
+             .count()
+
+    w = Window.partitionBy("starter_channel").orderBy(col("count").desc())
+    ranked = base.withColumn("rank", row_number().over(w)) \
+                 .filter(col("rank") <= top_n)
+
+    exprs = []
+    for i in range(1, top_n + 1):
+        exprs += [
+            max(when(col("rank") == i, col("channel"))).alias(f"{prefix}_chnl_{i}"),
+            max(when(col("rank") == i, col("count"))).alias(f"{prefix}_chnl_count_{i}")
+        ]
+
+    return ranked.groupBy("starter_channel").agg(*exprs)
+
+sec_df = top_contact(df, 2, "sec")
+third_df = top_contact(df, 3, "third")
+
+# ---------------- FINAL JOIN ----------------
+final_df = (
+    agg_df
+    .join(bucket_pivot, "starter_channel", "left")
+    .join(sec_df, "starter_channel", "left")
+    .join(third_df, "starter_channel", "left")
+    .withColumnRenamed("starter_channel", "Channel")
+    .withColumn("Date", lit(part))
+)
+
+# ---------------- FIX OUTPUT SCHEMA ----------------
+columns = [
+    "Date", "Channel", "total_case", "uniq_cust", "rep_rate",
+    "follow_up_0", "follow_up_1", "follow_up_2", "follow_up_3+",
+    "sec_chnl_1", "sec_chnl_2", "sec_chnl_3", "sec_chnl_4",
+    "sec_chnl_count_1", "sec_chnl_count_2", "sec_chnl_count_3", "sec_chnl_count_4",
+    "third_chnl_1", "third_chnl_2", "third_chnl_3", "third_chnl_4",
+    "third_chnl_count_1", "third_chnl_count_2", "third_chnl_count_3", "third_chnl_count_4"
+]
+
+for c in columns:
+    if c not in final_df.columns:
+          final_df = final_df.withColumn(c, lit(None))
+
+final_df = final_df.select(columns)
+
+# ---------------- SHOW RESULT ----------------
+final_df.show(truncate=False)
