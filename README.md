@@ -204,6 +204,16 @@ df = combined_df.withColumn("rn", row_number().over(w))
 starter_df = df.filter(col("rn") == 1).select("user_id", col("channel").alias("starter_channel"))
 df = df.join(starter_df, "user_id")
 
+# ---------------- DEBUG: Write windowed data to CSV ----------------
+debug_windowed_path = f"/user/2030435/CallCentreAnalystics/debug_windowed_{mnth}.csv"
+df.select("user_id", "event_ts", "channel", "rn", "starter_channel") \
+    .orderBy("user_id", "rn") \
+    .coalesce(1) \
+    .write.mode("overwrite") \
+    .option("header", True) \
+    .csv(debug_windowed_path)
+print(f"Debug windowed data written to: {debug_windowed_path}")
+
 # ---------------- TOTAL + REP RATE ----------------
 agg_df = df.groupBy("starter_channel").agg(
     count("*").alias("total_case"),
