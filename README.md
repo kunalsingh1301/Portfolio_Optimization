@@ -152,19 +152,7 @@ def read_call(path, debug_path=None):
       col("Customer No (CTI)").isNotNull()&(trim(col("Customer No (CTI)")) != "")
       )
     
-    #test_df = df.withColumn("pts",to_timestamp(col("Call Start Time"),"M-d-yyyy hh:mm)
-      
-    #df = df.withColumn("_raw_ts", col("Call Start Time"))
     df = normalize_timestamp(df, "Call Start Time")
-    #df = df.withColumn("event_ts",to_timestamp(col("Call Start Time"),"M-d-yyyy hh:mm"))
-
-    #if debug_path:
-    #    df.select(
-    #        col("Customer No (CTI)").alias("user_id"),
-    #        "_raw_ts",
-    #        "event_ts"
-    #    ).coalesce(1).write.mode("overwrite").option("header", True).csv(debug_path)
-    #    print(f"Call debug CSV written to: {debug_path}")
 
     return df.select(col("Customer No (CTI)").alias("user_id"),
                      "event_ts",
@@ -247,23 +235,34 @@ bucket_pivot = (
     .withColumnRenamed("3+", "follow_up_3+")
 )
 
-# ---------------- SECOND / THIRD CHANNEL (FIXED) ----------------
-def top_contact_fixed(df, rn, prefix, top_n=4):
-    nth_df = df.filter(col("rn") == rn)
-    base = nth_df.groupBy("starter_channel", "channel") \
-                 .agg(countDistinct("user_id").alias("user_count"))
+# ---------------- SECOND / THIRD CHANNEL (CORRECTED) ----------------
+def top_contact_after_starter(df, prefix, top_n=4):
+    """
+    Get top N channels contacted after the starter channel.
+    For second contact: all contacts with rn >= 2
+    For third contact: all contacts with rn >= 3
+    """
+    min_rn = 2 if prefix == "sec" else 3
+    
+    after_starter = df.filter(col("rn") >= min_rn)
+    
+    base = after_starter.groupBy("starter_channel", "channel") \
+                       .agg(countDistinct("user_id").alias("user_count"))
+    
     w = Window.partitionBy("starter_channel").orderBy(col("user_count").desc())
     ranked = base.withColumn("rank", row_number().over(w)).filter(col("rank") <= top_n)
+    
     exprs = []
     for i in range(1, top_n + 1):
         exprs += [
             max(when(col("rank") == i, col("channel"))).alias(f"{prefix}_chnl_{i}"),
             max(when(col("rank") == i, col("user_count"))).alias(f"{prefix}_chnl_count_{i}")
         ]
+    
     return ranked.groupBy("starter_channel").agg(*exprs)
 
-sec_df = top_contact_fixed(df, 2, "sec")
-third_df = top_contact_fixed(df, 3, "third")
+sec_df = top_contact_after_starter(df, "sec")
+third_df = top_contact_after_starter(df, "third")
 
 # ---------------- FINAL JOIN ----------------
 final_df = (
