@@ -1,21 +1,22 @@
 from pyspark.sql.functions import (
-    col, trim, when, regexp_replace,
+    col, trim, regexp_replace, when,
     to_timestamp, coalesce,
     unix_timestamp, from_unixtime, lit
 )
 
 def normalize_timestamp(df, ts_col):
 
-    # -------------------------------
-    # Raw trimmed string
-    # -------------------------------
+    # -------------------------------------------------
+    # 1. Raw string
+    # -------------------------------------------------
     df = df.withColumn("_raw_ts", trim(col(ts_col)))
 
-    # -------------------------------
-    # Fix Excel split numeric: 45926 0.7653 → 45926.7653
-    # -------------------------------
+    # -------------------------------------------------
+    # 2. Normalize Excel numeric strings
+    #    "45926 0.7653" -> "45926.7653"
+    # -------------------------------------------------
     df = df.withColumn(
-        "_excel_num",
+        "_excel_str",
         when(
             col("_raw_ts").rlike(r"^\d+\s+\d+(\.\d+)?$"),
             regexp_replace(col("_raw_ts"), r"\s+", ".")
@@ -25,17 +26,31 @@ def normalize_timestamp(df, ts_col):
         )
     )
 
-    # -------------------------------
-    # Excel numeric → timestamp
-    # -------------------------------
-    excel_ts = from_unixtime(
-        unix_timestamp(lit("1899-12-30")) +
-        (col("_excel_num").cast("double") * 86400)
+    # -------------------------------------------------
+    # 3. Convert Excel string -> DOUBLE
+    # -------------------------------------------------
+    df = df.withColumn(
+        "_excel_double",
+        col("_excel_str").cast("double")
     )
 
-    # -------------------------------
-    # String formats
-    # -------------------------------
+    # -------------------------------------------------
+    # 4. Excel DOUBLE -> timestamp
+    # -------------------------------------------------
+    df = df.withColumn(
+        "_excel_ts",
+        when(
+            col("_excel_double").isNotNull(),
+            from_unixtime(
+                unix_timestamp(lit("1899-12-30")) +
+                (col("_excel_double") * 86400)
+            )
+        )
+    )
+
+    # -------------------------------------------------
+    # 5. String timestamp parsing
+    # -------------------------------------------------
     formats = [
         "d-M-yy HH:mm:ss", "d-M-yy hh:mm:ss a",
         "d-M-yyyy HH:mm:ss", "d-M-yyyy hh:mm:ss a",
@@ -50,17 +65,21 @@ def normalize_timestamp(df, ts_col):
         "dd/MM/yyyy HH:mm"
     ]
 
-    string_ts = coalesce(
-        *[to_timestamp(col("_raw_ts"), f) for f in formats]
+    df = df.withColumn(
+        "_string_ts",
+        coalesce(*[to_timestamp(col("_raw_ts"), f) for f in formats])
     )
 
-    # -------------------------------
-    # FINAL event_ts (NO MIXING)
-    # -------------------------------
+    # -------------------------------------------------
+    # 6. FINAL event_ts
+    # -------------------------------------------------
     df = df.withColumn(
         "event_ts",
-        when(col("_excel_num").isNotNull(), excel_ts)
-        .otherwise(string_ts)
+        when(col("_excel_ts").isNotNull(), col("_excel_ts"))
+        .otherwise(col("_string_ts"))
     )
 
-    return df.drop("_raw_ts", "_excel_num")
+    return df.drop(
+        "_raw_ts", "_excel_str", "_excel_double",
+        "_excel_ts", "_string_ts"
+    )
