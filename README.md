@@ -8,8 +8,8 @@ spark = SparkSession.builder.appName("xxxx").enableHiveSupport().getOrCreate()
 spark.conf.set("spark.sql.legacy.timeParserPolicy", "LEGACY")
 
 # ---------------- CONFIG ----------------
-mnth = "aug"
-part = "202508"
+mnth = "mar"
+part = "202503"
 
 stacy_cnt = ["en", "zh"]
 stacy_auth = ["post"]
@@ -51,21 +51,23 @@ def normalize_timestamp(df, ts_col):
                concat(col("_ts"), lit(":00")))
           .otherwise(col("_ts"))
       )
-      
-      
   
       formats = [
           "d-M-yy HH:mm:ss", "d-M-yy hh:mm:ss a",
           "d-M-yyyy HH:mm:ss", "d-M-yyyy hh:mm:ss a",
           "d-M-yy HH:mm", "d-M-yy hh:mm a",
           "d-M-yyyy HH:mm", "d-M-yyyy hh:mm a",
-          
-          "M-d-yy HH:mm:ss","M-d-yyyy HH:mm:ss",
-          "M-d-yy HH:mm","M-d-yyyy HH:mm",
-          "M-d-yy HH:mm:ss a","M-d-yyyy HH:mm:ss a",
-          "M-d-yy HH:mm a","M-d-yyyy HH:mm a",
-          
-          "dd/MM/yyyy HH:mm"
+          "M-d-yy HH:mm:ss", "M-d-yyyy HH:mm:ss",
+          "M-d-yy HH:mm", "M-d-yyyy HH:mm",
+          "M-d-yy HH:mm:ss a", "M-d-yyyy HH:mm:ss a",
+          "M-d-yy HH:mm a", "M-d-yyyy HH:mm a",
+          "dd/MM/yyyy hh:mm a", "dd/MM/yyyy hh:mm:ss a",
+          "dd/MM/yy hh:mm a", "dd/MM/yy hh:mm:ss a",
+          "M/d/yy hh:mm a", "MM/dd/yy hh:mm a",
+          "M/d/yyyy hh:mm a", "MM/dd/yyyy hh:mm a",
+          "M/d/yy hh:mm:ss a", "MM/dd/yy hh:mm:ss a",
+          "M/d/yyyy hh:mm:ss a", "MM/dd/yyyy hh:mm:ss a",
+          "M/d/yy", "MM/dd/yy", "M/d/yyyy", "MM/dd/yyyy"
       ]
   
       df = df.withColumn(
@@ -133,6 +135,9 @@ def read_stacy(path):
     df = spark.read.option("header", True).csv(path)
     ts_col = "HKT" if "HKT" in df.columns else "date (UTC)"
     user_col = "user_id" if "user_id" in df.columns else "customer_id"
+    df = df.filter(col(user_col).isNotNull()&(trim(col(user_col)) != ""))
+    #print("Stacy")
+    #print(df.count())
     df = normalize_timestamp(df, ts_col)
     return df.select(col(user_col).alias("user_id"),
                      "event_ts",
@@ -141,6 +146,9 @@ def read_stacy(path):
 def read_ivr(path):
     df = spark.read.option("header", True).csv(path)
     df = df.filter(col("ONE_FA").isin(post_login_values))
+    df = df.filter(col("REL_ID").isNotNull()&(trim(col("REL_ID")) != ""))
+    #print("ivr")
+    #print(df.count())
     df = normalize_timestamp(df, "STARTTIME")
     return df.select(col("REL_ID").alias("user_id"),
                      "event_ts",
@@ -151,20 +159,13 @@ def read_call(path, debug_path=None):
     df=df.filter(
       col("Customer No (CTI)").isNotNull()&(trim(col("Customer No (CTI)")) != "")
       )
+    df = df.withColumn("raw_ts",col("Call Start Time"))
+    df = df.filter(df["Verification Status"] == "Pass")
+    #print("call")
+    #print(df.count())
     
-    #test_df = df.withColumn("pts",to_timestamp(col("Call Start Time"),"M-d-yyyy hh:mm)
-      
-    #df = df.withColumn("_raw_ts", col("Call Start Time"))
     df = normalize_timestamp(df, "Call Start Time")
-    #df = df.withColumn("event_ts",to_timestamp(col("Call Start Time"),"M-d-yyyy hh:mm"))
-
-    #if debug_path:
-    #    df.select(
-    #        col("Customer No (CTI)").alias("user_id"),
-    #        "_raw_ts",
-    #        "event_ts"
-    #    ).coalesce(1).write.mode("overwrite").option("header", True).csv(debug_path)
-    #    print(f"Call debug CSV written to: {debug_path}")
+    df.select( col("Customer No (CTI)").alias("user_id"),"raw_ts","event_ts").coalesce(1).write.mode("overwrite").csv(f"/user/2030435/CallCentreAnalystics/0001.csv")
 
     return df.select(col("Customer No (CTI)").alias("user_id"),
                      "event_ts",
@@ -174,6 +175,9 @@ def read_chat(path):
     df = spark.read.option("header", True).csv(path)
     df = df.filter(col("Pre/Post") == "Postlogin")
     df = df.withColumn("_ts", concat_ws(" ", col("Date7"), col("StartTime")))
+    df = df.filter(col("REL ID").isNotNull()&(trim(col("REL ID")) != ""))
+    #print("chat")
+    #print(df.count())
     df = normalize_timestamp(df, "_ts")
     return df.select(col("REL ID").alias("user_id"),
                      "event_ts",
@@ -209,6 +213,9 @@ combined_df = reduce(lambda a, b: a.unionByName(b), dfs) \
     .dropna(subset=["user_id", "event_ts"]) \
     .repartition("user_id") \
     .cache()
+
+total_postlogin_cases = combined_df.count()
+total_distinct_users = combined_df.select(col("user_id")).distinct().count()
 
 # ---------------- RN + STARTER CHANNEL ----------------
 w = Window.partitionBy("user_id").orderBy("event_ts")
