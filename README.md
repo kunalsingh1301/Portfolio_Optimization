@@ -1,19 +1,13 @@
-from pyspark.sql import SparkSession
-from pyspark.sql.types import StructType
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, FloatType
 from pyspark.sql.functions import *
+from pyspark.sql import SparkSession
 from pyspark.sql.utils import AnalysisException
-from functools import reduce
+import builtins
 
-# --------------------------------------------------
-# SPARK SESSION
-# --------------------------------------------------
-spark = SparkSession.builder \
-    .appName("ChatNatureAnalytics") \
-    .getOrCreate()
+# Initialize Spark session
+spark = SparkSession.builder.appName("CallCentreAnalytics").getOrCreate()
 
-# --------------------------------------------------
-# MONTH CONFIG
-# --------------------------------------------------
+# Define months and their abbreviations
 months = {
     '202501': 'jan', '202502': 'feb', '202503': 'mar',
     '202504': 'apr', '202505': 'may', '202506': 'jun',
@@ -21,167 +15,246 @@ months = {
     '202510': 'oct', '202511': 'nov'
 }
 
-# --------------------------------------------------
-# HDFS HELPERS
-# --------------------------------------------------
-hadoop_fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
-    spark._jsc.hadoopConfiguration()
-)
+# Dummy numbers for total HK clients for each month
+total_HK_clients = {
+    '202501': 1748757, '202502': 1750599, '202503': 1756233,
+    '202504': 1759238, '202505': 1763332, '202506': 1771993,
+    '202507': 1778015, '202508': 1783201, '202509': 1789956,
+    '202510': 1793187, '202511': 1793187
+}
 
-def path_exists(p):
-    return hadoop_fs.exists(
-        spark._jvm.org.apache.hadoop.fs.Path(p)
-    )
+stacy_cnt = ['en', 'zh']
+stacy_auth = ['pre', 'post']
+post_login_values = ["OTP|S", "VB|S", "TPIN|S"]
 
-# --------------------------------------------------
-# READ CHAT
-# --------------------------------------------------
-def read_chat(path, part):
-    df = spark.read.option("header", True).csv(path)
-    return (
-        df.filter(col("Pre/Post") == "Postlogin")
-          .withColumn("mnth", lit(part))
-          .select(
-              col("REL ID").alias("user_id"),
-              col("NumericId").alias("num_id"),
-              col("mnth")
-          )
-    )
+# Define schemas
+schema = StructType([
+    StructField("month", StringType(), False),
+    StructField("total_contact", StringType(), True),
+    StructField("volume", IntegerType(), True)
+])
 
-# --------------------------------------------------
-# READ CHAT NATURE (FIX BAD HEADER)
-# --------------------------------------------------
-def read_chat_nature(path, part):
-    df = spark.read.option("header", "false") \
-        .option("inferSchema", "true") \
-        .csv(path)
+schema2 = StructType([
+    StructField("month", StringType(), False),
+    StructField("total_contact_postlogin", StringType(), True),
+    StructField("volume", IntegerType(), True)
+])
 
-    # 3rd row is the real header
-    new_header = df.limit(3).collect()[2]
+schema3 = StructType([
+    StructField("month", StringType(), False),
+    StructField("unique_contact_count", StringType(), True),
+    StructField("volume", IntegerType(), True)
+])
 
-    df_data = (
-        df.rdd.zipWithIndex()
-          .filter(lambda x: x[1] > 3)
-          .map(lambda x: x[0])
-          .toDF()
-    )
+schema4 = StructType([
+    StructField("month", StringType(), False),
+    StructField("contact_ratio", StringType(), True),
+    StructField("volume", FloatType(), True)
+])
 
-    df_final = df_data.toDF(*new_header)
+# Initialize lists to store results
+data = []
+total_client_post = []
+total_client_pre  = []
+uniq_channel_cust = []
+contact_rat = []
 
-    return (
-        df_final
-        .withColumn("mnth", lit(part))
-        .select(
-            col("Numeric ID").alias("num_id"),
-            col("Combine").alias("nature"),
-            col("mnth")
-        )
-    )
-
-# --------------------------------------------------
-# SAFE READ
-# --------------------------------------------------
-def safe_read(func, part, path):
-    try:
-        if path_exists(path):
-            df = func(path, part)
-            if not df.rdd.isEmpty():
-                return df
-        else:
-            print(f"Missing: {path}")
-    except AnalysisException as e:
-        print(f"AnalysisException: {e}")
-    except Exception as e:
-        print(f"Exception: {e}")
-    return None
-
-# --------------------------------------------------
-# READ ALL MONTHS
-# --------------------------------------------------
-chat_dfs = []
-nature_dfs = []
+hadoop_fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
 
 for part, mnth in months.items():
-    chat_path = f"/user/2030435/CallCentreAnalystics/{mnth}_chat.csv"
-    nature_path = f"/user/2030435/CallCentreAnalystics/{mnth}_chat_nature.csv"
+    # Construct file paths
+    file_paths_stacy = {}
+    for cnt in stacy_cnt:
+        for auth in stacy_auth:
+            file_key = f'{mnth}_stacy_{cnt}_{auth}'
+            file_path = f"/user/2030435/CallCentreAnalystics/{file_key}login.csv"
+            file_paths_stacy[file_key] = file_path
 
-    df = safe_read(read_chat, part, chat_path)
-    if df is not None:
-        chat_dfs.append(df)
+    ivr_file_paths = {}
+    for i in range(1, 5):
+        file_key = f'{mnth}_ivr{i}'
+        file_path = f"/user/2030435/CallCentreAnalystics/{mnth}_ivr{i}.csv"
+        ivr_file_paths[file_key] = file_path
 
-    df = safe_read(read_chat_nature, part, nature_path)
-    if df is not None:
-        nature_dfs.append(df)
+    callcc = f"/user/2030435/CallCentreAnalystics/{mnth}_call.csv"
+    chat_cc = f"/user/2030435/CallCentreAnalystics/{mnth}_chat.csv"
 
-# --------------------------------------------------
-# UNION ALL MONTHS
-# --------------------------------------------------
-if chat_dfs:
-    chat_df = reduce(lambda d1, d2: d1.unionByName(d2), chat_dfs)
-else:
-    chat_df = spark.createDataFrame([], StructType([]))
+    # Read Stacy data
+    stacy_dfs = {}
+    for cnt in stacy_cnt:
+        for auth in stacy_auth:
+            key = f'{mnth}_stacy_{cnt}_{auth}'
+            path = file_paths_stacy[key]
+            if hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(path)):
+                df = spark.read\
+                .option("header","true") \
+                .option("delimiter",",") \
+                .csv(path)
+                if 'post' in auth:
+                  user_col = "user_id" if "user_id" in df.columns else "customer_id"
+                  df = df.filter(col(user_col).isNotNull()&(trim(col(user_col)) != ""))
+                stacy_dfs[key] = df
+            else:
+                print(f"File not found: {path}")
 
-if nature_dfs:
-    nature_df = reduce(lambda d1, d2: d1.unionByName(d2), nature_dfs)
-else:
-    nature_df = spark.createDataFrame([], StructType([]))
+    # Read IVR data
+    ivr_dfs = {}
+    for key, path in ivr_file_paths.items():
+        if hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(path)):
+            df = spark.read.csv(path, header=True, inferSchema=True)
+            df = df.filter(col("REL_ID").isNotNull()&(trim(col("REL_ID")) != ""))
+            ivr_dfs[key] = df
+        else:
+            print(f"IVR file not found: {path}")
 
-# --------------------------------------------------
-# JOIN CHAT + NATURE
-# --------------------------------------------------
-final_df = chat_df.join(
-    nature_df,
-    on=["num_id", "mnth"],
-    how="left"
-)
+    # Read Call and Chat data
+    if hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(callcc)):
+        df_call_cc = spark.read.csv(callcc, header=True, inferSchema=True)
+        df_call_cc=df_call_cc.filter(
+                  col("Customer No (CTI)").isNotNull()&(trim(col("Customer No (CTI)")) != "")
+                )
+    else:
+        df_call_cc = None
+        print(f"Call file not found: {callcc}")
 
-# --------------------------------------------------
-# AGGREGATE PER USER
-# --------------------------------------------------
-agg_df = final_df.groupBy("user_id").agg(
-    count("*").alias("contact_count"),
-    collect_set("nature").alias("natures"),
-    collect_list("mnth").alias("months")
-)
+    if hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(chat_cc)):
+        df_chat_cc = spark.read.csv(chat_cc, header=True, inferSchema=True)
+        df_chat_cc = df_chat_cc.filter(col("REL ID").isNotNull()&(trim(col("REL ID")) != ""))
+    else:
+        df_chat_cc = None
+        print(f"Chat file not found: {chat_cc}")
 
-# --------------------------------------------------
-# FILTER MULTI-CONTACT USERS
-# --------------------------------------------------
-final_df = agg_df.filter(col("contact_count") > 1)
+    # Process data
+    count1 = builtins.sum([df.count() for df in stacy_dfs.values()])
+    if df_call_cc:
+        df_call_cc=df_call_cc.filter(
+                  col("Customer No (CTI)").isNotNull()&(trim(col("Customer No (CTI)")) != "")
+                )
+        df_call_cc = df_call_cc.toDF(*(col.replace(' ', '_') for col in df_call_cc.columns))
+        count2 = df_call_cc.count()
+    else:
+        count2 = 0
 
-# --------------------------------------------------
-# ARRAY → STRING (CSV SAFE)
-# --------------------------------------------------
-final_df = final_df \
-    .withColumn("natures", concat_ws("|", col("natures"))) \
-    .withColumn("months", concat_ws("|", col("months")))
+    if df_chat_cc:
+        count3 = df_chat_cc.count()
+    else:
+        count3 = 0
 
-# --------------------------------------------------
-# WRITE SINGLE CSV
-# --------------------------------------------------
-OUTPUT_DIR = "/user/2030435/CallCentreAnalystics/ChatNatureAgg"
+    count4 = builtins.sum([df.count() for df in ivr_dfs.values()])
 
-final_df.coalesce(1) \
-    .write \
-    .mode("overwrite") \
-    .option("header", True) \
-    .csv(OUTPUT_DIR)
+    count1_post = builtins.sum([df.count() for key, df in stacy_dfs.items() if 'post' in key])
+    if df_call_cc:
+        count2_post = df_call_cc.filter(df_call_cc["Verification_Status"] == "Pass").count()
+    else:
+        count2_post = 0
 
-# --------------------------------------------------
-# RENAME part FILE
-# --------------------------------------------------
-fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
-    spark._jsc.hadoopConfiguration()
-)
+    if df_chat_cc:
+        count3_post = df_chat_cc.filter(df_chat_cc["Pre/Post"] == "Postlogin").count()
+    else:
+        count3_post = 0
 
-path = spark._jvm.org.apache.hadoop.fs.Path(OUTPUT_DIR)
+    count4_post = builtins.sum([df.filter(col("ONE_FA").isin(post_login_values)).count() for df in ivr_dfs.values()])
 
-for f in fs.listStatus(path):
-    name = f.getPath().getName()
-    if name.startswith("part-") and name.endswith(".csv"):
-        fs.rename(
-            f.getPath(),
-            spark._jvm.org.apache.hadoop.fs.Path(
-                OUTPUT_DIR + "/ChatNatureAgg.csv"
-            )
-        )
+    all_stacy_usr_ids = []
+    for key, df in stacy_dfs.items():
+        if 'post' in key:
+            if 'user_id' in df.columns:
+                usr_ids = df.select("user_id").distinct().rdd.flatMap(lambda x: x).collect()
+            elif 'customer_id' in df.columns:
+                usr_ids = df.select("customer_id").distinct().rdd.flatMap(lambda x: x).collect()
+            else:
+                usr_ids = []
+            all_stacy_usr_ids.extend(usr_ids)
+    count_uniq_stacy = len(set(all_stacy_usr_ids))
+
+    if df_call_cc:
+        count_uniq_call = df_call_cc.select("Customer_No_(CTI)").distinct().count()
+    else:
+        count_uniq_call = 0
+
+    if df_chat_cc:
+        count_uniq_chat = df_chat_cc.select("REL ID").distinct().count()
+    else:
+        count_uniq_chat = 0
+
+    all_ivr_rel_ids = []
+    for key, df in ivr_dfs.items():
+        rel_ids = df.select("REL_ID").distinct().rdd.flatMap(lambda x: x).collect()
+        all_ivr_rel_ids.extend(rel_ids)
+    count_uniq_ivr = len(set(all_ivr_rel_ids))
+
+    if count1 > 0:
+        data.append((part, "Stacy", count1))
+    if count3 > 0:
+        data.append((part, "Live Chat", count3))
+    if count2 > 0:
+        data.append((part, "Call", count2))
+    if count4 > 0:
+        data.append((part, "IVR", count4))
+
+    if count1_post > 0:
+        total_client_post.append((part, "Stacy", count1_post))
+    if count3_post > 0:
+        total_client_post.append((part, "Live Chat", count3_post))
+    if count2_post > 0:
+        total_client_post.append((part, "Call", count2_post))
+    if count4_post > 0:
+        total_client_post.append((part, "IVR", count4_post))
+    
+    if (count1 - count1_post) > 0:
+        total_client_pre.append((part, "Stacy", (count1 - count1_post)))
+    if (count2 - count2_post) > 0:
+        total_client_pre.append((part, "Live Chat", (count3 - count3_post)))
+    if (count3 - count3_post) > 0:
+        total_client_pre.append((part, "Call", (count2 - count2_post)))
+    if (count4 - count4_post) > 0:
+        total_client_pre.append((part, "IVR", (count4 - count4_post)))
+    
+    if count_uniq_stacy > 0:
+        uniq_channel_cust.append((part, "Stacy", count_uniq_stacy))
+    if count_uniq_chat > 0:
+        uniq_channel_cust.append((part, "Live Chat", count_uniq_chat))
+    if count_uniq_call > 0:
+        uniq_channel_cust.append((part, "Call", count_uniq_call))
+    if count_uniq_ivr > 0:
+        uniq_channel_cust.append((part, "IVR", count_uniq_ivr))
+
+    total_HK_client = total_HK_clients[part]
+    if count_uniq_stacy > 0:
+        contact_rat.append((part, "Stacy", count_uniq_stacy / total_HK_client * 100))
+    if count_uniq_chat > 0:
+        contact_rat.append((part, "Live Chat", count_uniq_chat / total_HK_client * 100))
+    if count_uniq_call > 0:
+        contact_rat.append((part, "Call", count_uniq_call / total_HK_client * 100))
+    if count_uniq_ivr > 0:
+        contact_rat.append((part, "IVR", count_uniq_ivr / total_HK_client * 100))
+
+# Define schemas
+schema = ["month", "total_contact", "volume"]
+schema2 = ["month", "total_contact_postlogin", "volume"]
+schema21 = ["month", "total_contact_prelogin", "volume"]
+schema3 = ["month", "unique_contact_count", "volume"]
+schema4 = ["month", "contact_ratio", "volume"]
+
+# Create DataFrames
+df_client_contact_overview = spark.createDataFrame(data, schema)
+df_client_contact_overview_postlogin = spark.createDataFrame(total_client_post, schema2)
+df_client_contact_overview_prelogin = spark.createDataFrame(total_client_pre, schema21)
+df_uniq_channel_cust = spark.createDataFrame(uniq_channel_cust, schema3)
+df_contact_ratio = spark.createDataFrame(contact_rat, schema4)
+
+# Format and show results
+df_client_contact_overview = df_client_contact_overview.withColumn("formatted_volume", format_number("volume", 0))
+df_client_contact_overview_postlogin = df_client_contact_overview_postlogin.withColumn("formatted_volume", format_number("volume", 0))
+df_client_contact_overview_prelogin = df_client_contact_overview_prelogin.withColumn("formatted_volume", format_number("volume", 0))
+df_uniq_channel_cust = df_uniq_channel_cust.withColumn("formatted_volume", format_number("volume", 0))
+df_contact_ratio = df_contact_ratio.withColumn("percentage", format_number("volume", 2))
+
+df_client_contact_overview.select("month", "total_contact", "formatted_volume").show(100,truncate=False)
+df_client_contact_overview_postlogin.select("month", "total_contact_postlogin", "formatted_volume").show(100,truncate=False)
+df_client_contact_overview_prelogin.select("month", "total_contact_prelogin", "formatted_volume").show(100,truncate=False)
+df_uniq_channel_cust.select("month", "unique_contact_count", "formatted_volume").show(100,truncate=False)
+df_contact_ratio.select("month", "contact_ratio", "percentage").show(100,truncate=False)
+
+#Base = f"/user/2030435/CallCentreAnalystics/output";
+#df_client_contact_overview.coalesce(1).write.mode("overwrite").option("header","true").csv(f"{Base}/total_contacts")
