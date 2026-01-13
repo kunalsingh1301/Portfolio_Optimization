@@ -1,13 +1,17 @@
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType, FloatType
-from pyspark.sql.functions import *
-from pyspark.sql import SparkSession
-from pyspark.sql.utils import AnalysisException
-import builtins
+from pyspark.sql import SparkSession, functions as F
 
-# Initialize Spark session
-spark = SparkSession.builder.appName("CallCentreAnalytics").getOrCreate()
+# --------------------------------------------------
+# SPARK SESSION
+# --------------------------------------------------
+spark = SparkSession.builder.appName("CallCentreAnalytics_Clean").getOrCreate()
 
-# Define months and their abbreviations
+hadoop_fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
+    spark._jsc.hadoopConfiguration()
+)
+
+# --------------------------------------------------
+# CONFIG
+# --------------------------------------------------
 months = {
     '202501': 'jan', '202502': 'feb', '202503': 'mar',
     '202504': 'apr', '202505': 'may', '202506': 'jun',
@@ -15,7 +19,6 @@ months = {
     '202510': 'oct', '202511': 'nov'
 }
 
-# Dummy numbers for total HK clients for each month
 total_HK_clients = {
     '202501': 1748757, '202502': 1750599, '202503': 1756233,
     '202504': 1759238, '202505': 1763332, '202506': 1771993,
@@ -23,238 +26,139 @@ total_HK_clients = {
     '202510': 1793187, '202511': 1793187
 }
 
-stacy_cnt = ['en', 'zh']
-stacy_auth = ['pre', 'post']
 post_login_values = ["OTP|S", "VB|S", "TPIN|S"]
 
-# Define schemas
-schema = StructType([
-    StructField("month", StringType(), False),
-    StructField("total_contact", StringType(), True),
-    StructField("volume", IntegerType(), True)
-])
+# --------------------------------------------------
+# HELPERS
+# --------------------------------------------------
+def read_csv(path, id_col):
+    """Read CSV only if exists and clean ID column"""
+    if not hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(path)):
+        return None
 
-schema2 = StructType([
-    StructField("month", StringType(), False),
-    StructField("total_contact_postlogin", StringType(), True),
-    StructField("volume", IntegerType(), True)
-])
+    return (
+        spark.read.option("header", "true")
+        .option("inferSchema", "true")
+        .csv(path)
+        .filter(F.col(id_col).isNotNull() & (F.trim(F.col(id_col)) != ""))
+    )
 
-schema3 = StructType([
-    StructField("month", StringType(), False),
-    StructField("unique_contact_count", StringType(), True),
-    StructField("volume", IntegerType(), True)
-])
 
-schema4 = StructType([
-    StructField("month", StringType(), False),
-    StructField("contact_ratio", StringType(), True),
-    StructField("volume", FloatType(), True)
-])
+def normalize(df):
+    return df.toDF(*[c.replace(" ", "_").replace("(", "").replace(")", "") for c in df.columns])
 
-# Initialize lists to store results
-data = []
-total_client_post = []
-total_client_pre  = []
-uniq_channel_cust = []
-contact_rat = []
 
-hadoop_fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
+def add_result(lst, month, channel, value):
+    if value > 0:
+        lst.append((month, channel, value))
 
+
+# --------------------------------------------------
+# FINAL RESULT CONTAINERS
+# --------------------------------------------------
+total_cnt   = []
+post_cnt    = []
+pre_cnt     = []
+unique_cnt  = []
+ratio_cnt   = []
+
+# --------------------------------------------------
+# MAIN PIPELINE
+# --------------------------------------------------
 for part, mnth in months.items():
-    # Construct file paths
-    file_paths_stacy = {}
-    for cnt in stacy_cnt:
-        for auth in stacy_auth:
-            file_key = f'{mnth}_stacy_{cnt}_{auth}'
-            file_path = f"/user/2030435/CallCentreAnalystics/{file_key}login.csv"
-            file_paths_stacy[file_key] = file_path
 
-    ivr_file_paths = {}
+    # ---------- STACY ----------
+    stacy_all, stacy_post = None, None
+    for cnt in ["en", "zh"]:
+        for auth in ["pre", "post"]:
+            path = f"/user/2030435/CallCentreAnalystics/{mnth}_stacy_{cnt}_{auth}login.csv"
+            df = read_csv(path, "user_id")
+            if not df:
+                continue
+
+            stacy_all = df if stacy_all is None else stacy_all.unionByName(df)
+            if auth == "post":
+                stacy_post = df if stacy_post is None else stacy_post.unionByName(df)
+
+    # ---------- CALL ----------
+    call_df = read_csv(
+        f"/user/2030435/CallCentreAnalystics/{mnth}_call.csv",
+        "Customer No (CTI)"
+    )
+    if call_df:
+        call_df = normalize(call_df)
+
+    # ---------- CHAT ----------
+    chat_df = read_csv(
+        f"/user/2030435/CallCentreAnalystics/{mnth}_chat.csv",
+        "REL ID"
+    )
+
+    # ---------- IVR ----------
+    ivr_df = None
     for i in range(1, 5):
-        file_key = f'{mnth}_ivr{i}'
-        file_path = f"/user/2030435/CallCentreAnalystics/{mnth}_ivr{i}.csv"
-        ivr_file_paths[file_key] = file_path
+        df = read_csv(
+            f"/user/2030435/CallCentreAnalystics/{mnth}_ivr{i}.csv",
+            "REL_ID"
+        )
+        if df:
+            ivr_df = df if ivr_df is None else ivr_df.unionByName(df)
 
-    callcc = f"/user/2030435/CallCentreAnalystics/{mnth}_call.csv"
-    chat_cc = f"/user/2030435/CallCentreAnalystics/{mnth}_chat.csv"
+    # ---------- COUNTS ----------
+    cnt_stacy = stacy_all.count() if stacy_all else 0
+    cnt_call  = call_df.count() if call_df else 0
+    cnt_chat  = chat_df.count() if chat_df else 0
+    cnt_ivr   = ivr_df.count() if ivr_df else 0
 
-    # Read Stacy data
-    stacy_dfs = {}
-    for cnt in stacy_cnt:
-        for auth in stacy_auth:
-            key = f'{mnth}_stacy_{cnt}_{auth}'
-            path = file_paths_stacy[key]
-            if hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(path)):
-                df = spark.read\
-                .option("header","true") \
-                .option("delimiter",",") \
-                .csv(path)
-                if 'post' in auth:
-                  user_col = "user_id" if "user_id" in df.columns else "customer_id"
-                  df = df.filter(col(user_col).isNotNull()&(trim(col(user_col)) != ""))
-                stacy_dfs[key] = df
-            else:
-                print(f"File not found: {path}")
+    cnt_stacy_post = stacy_post.count() if stacy_post else 0
+    cnt_call_post  = call_df.filter(F.col("Verification_Status")=="Pass").count() if call_df else 0
+    cnt_chat_post  = chat_df.filter(F.col("Pre/Post")=="Postlogin").count() if chat_df else 0
+    cnt_ivr_post   = ivr_df.filter(F.col("ONE_FA").isin(post_login_values)).count() if ivr_df else 0
 
-    # Read IVR data
-    ivr_dfs = {}
-    for key, path in ivr_file_paths.items():
-        if hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(path)):
-            df = spark.read.csv(path, header=True, inferSchema=True)
-            df = df.filter(col("REL_ID").isNotNull()&(trim(col("REL_ID")) != ""))
-            ivr_dfs[key] = df
-        else:
-            print(f"IVR file not found: {path}")
+    # ---------- UNIQUE ----------
+    uniq_stacy = stacy_post.select("user_id").distinct().count() if stacy_post else 0
+    uniq_call  = call_df.select("Customer_No_CTI").distinct().count() if call_df else 0
+    uniq_chat  = chat_df.select("REL ID").distinct().count() if chat_df else 0
+    uniq_ivr   = ivr_df.select("REL_ID").distinct().count() if ivr_df else 0
 
-    # Read Call and Chat data
-    if hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(callcc)):
-        df_call_cc = spark.read.csv(callcc, header=True, inferSchema=True)
-        df_call_cc=df_call_cc.filter(
-                  col("Customer No (CTI)").isNotNull()&(trim(col("Customer No (CTI)")) != "")
-                )
-    else:
-        df_call_cc = None
-        print(f"Call file not found: {callcc}")
+    # ---------- STORE RESULTS ----------
+    add_result(total_cnt, part, "Stacy", cnt_stacy)
+    add_result(total_cnt, part, "Call", cnt_call)
+    add_result(total_cnt, part, "Live Chat", cnt_chat)
+    add_result(total_cnt, part, "IVR", cnt_ivr)
 
-    if hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(chat_cc)):
-        df_chat_cc = spark.read.csv(chat_cc, header=True, inferSchema=True)
-        df_chat_cc = df_chat_cc.filter(col("REL ID").isNotNull()&(trim(col("REL ID")) != ""))
-    else:
-        df_chat_cc = None
-        print(f"Chat file not found: {chat_cc}")
+    add_result(post_cnt, part, "Stacy", cnt_stacy_post)
+    add_result(post_cnt, part, "Call", cnt_call_post)
+    add_result(post_cnt, part, "Live Chat", cnt_chat_post)
+    add_result(post_cnt, part, "IVR", cnt_ivr_post)
 
-    # Process data
-    count1 = builtins.sum([df.count() for df in stacy_dfs.values()])
-    if df_call_cc:
-        df_call_cc=df_call_cc.filter(
-                  col("Customer No (CTI)").isNotNull()&(trim(col("Customer No (CTI)")) != "")
-                )
-        df_call_cc = df_call_cc.toDF(*(col.replace(' ', '_') for col in df_call_cc.columns))
-        count2 = df_call_cc.count()
-    else:
-        count2 = 0
+    add_result(pre_cnt, part, "Stacy", cnt_stacy - cnt_stacy_post)
+    add_result(pre_cnt, part, "Call", cnt_call - cnt_call_post)
+    add_result(pre_cnt, part, "Live Chat", cnt_chat - cnt_chat_post)
+    add_result(pre_cnt, part, "IVR", cnt_ivr - cnt_ivr_post)
 
-    if df_chat_cc:
-        count3 = df_chat_cc.count()
-    else:
-        count3 = 0
+    add_result(unique_cnt, part, "Stacy", uniq_stacy)
+    add_result(unique_cnt, part, "Call", uniq_call)
+    add_result(unique_cnt, part, "Live Chat", uniq_chat)
+    add_result(unique_cnt, part, "IVR", uniq_ivr)
 
-    count4 = builtins.sum([df.count() for df in ivr_dfs.values()])
+    hk = total_HK_clients[part]
+    add_result(ratio_cnt, part, "Stacy", uniq_stacy * 100 / hk)
+    add_result(ratio_cnt, part, "Call", uniq_call * 100 / hk)
+    add_result(ratio_cnt, part, "Live Chat", uniq_chat * 100 / hk)
+    add_result(ratio_cnt, part, "IVR", uniq_ivr * 100 / hk)
 
-    count1_post = builtins.sum([df.count() for key, df in stacy_dfs.items() if 'post' in key])
-    if df_call_cc:
-        count2_post = df_call_cc.filter(df_call_cc["Verification_Status"] == "Pass").count()
-    else:
-        count2_post = 0
+# --------------------------------------------------
+# OUTPUT DATAFRAMES
+# --------------------------------------------------
+df_total  = spark.createDataFrame(total_cnt,  ["month","channel","volume"])
+df_post   = spark.createDataFrame(post_cnt,   ["month","channel","volume"])
+df_pre    = spark.createDataFrame(pre_cnt,    ["month","channel","volume"])
+df_unique = spark.createDataFrame(unique_cnt, ["month","channel","volume"])
+df_ratio  = spark.createDataFrame(ratio_cnt,  ["month","channel","percentage"])
 
-    if df_chat_cc:
-        count3_post = df_chat_cc.filter(df_chat_cc["Pre/Post"] == "Postlogin").count()
-    else:
-        count3_post = 0
-
-    count4_post = builtins.sum([df.filter(col("ONE_FA").isin(post_login_values)).count() for df in ivr_dfs.values()])
-
-    all_stacy_usr_ids = []
-    for key, df in stacy_dfs.items():
-        if 'post' in key:
-            if 'user_id' in df.columns:
-                usr_ids = df.select("user_id").distinct().rdd.flatMap(lambda x: x).collect()
-            elif 'customer_id' in df.columns:
-                usr_ids = df.select("customer_id").distinct().rdd.flatMap(lambda x: x).collect()
-            else:
-                usr_ids = []
-            all_stacy_usr_ids.extend(usr_ids)
-    count_uniq_stacy = len(set(all_stacy_usr_ids))
-
-    if df_call_cc:
-        count_uniq_call = df_call_cc.select("Customer_No_(CTI)").distinct().count()
-    else:
-        count_uniq_call = 0
-
-    if df_chat_cc:
-        count_uniq_chat = df_chat_cc.select("REL ID").distinct().count()
-    else:
-        count_uniq_chat = 0
-
-    all_ivr_rel_ids = []
-    for key, df in ivr_dfs.items():
-        rel_ids = df.select("REL_ID").distinct().rdd.flatMap(lambda x: x).collect()
-        all_ivr_rel_ids.extend(rel_ids)
-    count_uniq_ivr = len(set(all_ivr_rel_ids))
-
-    if count1 > 0:
-        data.append((part, "Stacy", count1))
-    if count3 > 0:
-        data.append((part, "Live Chat", count3))
-    if count2 > 0:
-        data.append((part, "Call", count2))
-    if count4 > 0:
-        data.append((part, "IVR", count4))
-
-    if count1_post > 0:
-        total_client_post.append((part, "Stacy", count1_post))
-    if count3_post > 0:
-        total_client_post.append((part, "Live Chat", count3_post))
-    if count2_post > 0:
-        total_client_post.append((part, "Call", count2_post))
-    if count4_post > 0:
-        total_client_post.append((part, "IVR", count4_post))
-    
-    if (count1 - count1_post) > 0:
-        total_client_pre.append((part, "Stacy", (count1 - count1_post)))
-    if (count2 - count2_post) > 0:
-        total_client_pre.append((part, "Live Chat", (count3 - count3_post)))
-    if (count3 - count3_post) > 0:
-        total_client_pre.append((part, "Call", (count2 - count2_post)))
-    if (count4 - count4_post) > 0:
-        total_client_pre.append((part, "IVR", (count4 - count4_post)))
-    
-    if count_uniq_stacy > 0:
-        uniq_channel_cust.append((part, "Stacy", count_uniq_stacy))
-    if count_uniq_chat > 0:
-        uniq_channel_cust.append((part, "Live Chat", count_uniq_chat))
-    if count_uniq_call > 0:
-        uniq_channel_cust.append((part, "Call", count_uniq_call))
-    if count_uniq_ivr > 0:
-        uniq_channel_cust.append((part, "IVR", count_uniq_ivr))
-
-    total_HK_client = total_HK_clients[part]
-    if count_uniq_stacy > 0:
-        contact_rat.append((part, "Stacy", count_uniq_stacy / total_HK_client * 100))
-    if count_uniq_chat > 0:
-        contact_rat.append((part, "Live Chat", count_uniq_chat / total_HK_client * 100))
-    if count_uniq_call > 0:
-        contact_rat.append((part, "Call", count_uniq_call / total_HK_client * 100))
-    if count_uniq_ivr > 0:
-        contact_rat.append((part, "IVR", count_uniq_ivr / total_HK_client * 100))
-
-# Define schemas
-schema = ["month", "total_contact", "volume"]
-schema2 = ["month", "total_contact_postlogin", "volume"]
-schema21 = ["month", "total_contact_prelogin", "volume"]
-schema3 = ["month", "unique_contact_count", "volume"]
-schema4 = ["month", "contact_ratio", "volume"]
-
-# Create DataFrames
-df_client_contact_overview = spark.createDataFrame(data, schema)
-df_client_contact_overview_postlogin = spark.createDataFrame(total_client_post, schema2)
-df_client_contact_overview_prelogin = spark.createDataFrame(total_client_pre, schema21)
-df_uniq_channel_cust = spark.createDataFrame(uniq_channel_cust, schema3)
-df_contact_ratio = spark.createDataFrame(contact_rat, schema4)
-
-# Format and show results
-df_client_contact_overview = df_client_contact_overview.withColumn("formatted_volume", format_number("volume", 0))
-df_client_contact_overview_postlogin = df_client_contact_overview_postlogin.withColumn("formatted_volume", format_number("volume", 0))
-df_client_contact_overview_prelogin = df_client_contact_overview_prelogin.withColumn("formatted_volume", format_number("volume", 0))
-df_uniq_channel_cust = df_uniq_channel_cust.withColumn("formatted_volume", format_number("volume", 0))
-df_contact_ratio = df_contact_ratio.withColumn("percentage", format_number("volume", 2))
-
-df_client_contact_overview.select("month", "total_contact", "formatted_volume").show(100,truncate=False)
-df_client_contact_overview_postlogin.select("month", "total_contact_postlogin", "formatted_volume").show(100,truncate=False)
-df_client_contact_overview_prelogin.select("month", "total_contact_prelogin", "formatted_volume").show(100,truncate=False)
-df_uniq_channel_cust.select("month", "unique_contact_count", "formatted_volume").show(100,truncate=False)
-df_contact_ratio.select("month", "contact_ratio", "percentage").show(100,truncate=False)
-
-#Base = f"/user/2030435/CallCentreAnalystics/output";
-#df_client_contact_overview.coalesce(1).write.mode("overwrite").option("header","true").csv(f"{Base}/total_contacts")
+df_total.show(100, False)
+df_post.show(100, False)
+df_pre.show(100, False)
+df_unique.show(100, False)
+df_ratio.show(100, False)
