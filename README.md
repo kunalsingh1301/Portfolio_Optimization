@@ -8,8 +8,8 @@ spark = SparkSession.builder.appName("xxxx").enableHiveSupport().getOrCreate()
 spark.conf.set("spark.sql.legacy.timeParserPolicy", "LEGACY")
 
 # ---------------- CONFIG ----------------
-mnth = "jan"
-part = "202501"
+mnth = "aug"
+part = "202508"
 
 stacy_cnt = ["en", "zh"]
 stacy_auth = ["post"]
@@ -133,11 +133,7 @@ def read_stacy(path):
     df = spark.read.option("header", True).csv(path)
     ts_col = "HKT" if "HKT" in df.columns else "date (UTC)"
     user_col = "user_id" if "user_id" in df.columns else "customer_id"
-    df = df.filter(col(user_col).isNotNull()&(trim(col(user_col)) != ""))
-    print("Stacy")
-    print(df.count())
     df = normalize_timestamp(df, ts_col)
-    print(df.count())
     return df.select(col(user_col).alias("user_id"),
                      "event_ts",
                      lit("Stacy").alias("channel"))
@@ -145,11 +141,7 @@ def read_stacy(path):
 def read_ivr(path):
     df = spark.read.option("header", True).csv(path)
     df = df.filter(col("ONE_FA").isin(post_login_values))
-    df = df.filter(col("REL_ID").isNotNull()&(trim(col("REL_ID")) != ""))
-    print("ivr")
-    print(df.count())
     df = normalize_timestamp(df, "STARTTIME")
-    print(df.count())
     return df.select(col("REL_ID").alias("user_id"),
                      "event_ts",
                      lit("IVR").alias("channel"))
@@ -159,12 +151,20 @@ def read_call(path, debug_path=None):
     df=df.filter(
       col("Customer No (CTI)").isNotNull()&(trim(col("Customer No (CTI)")) != "")
       )
-    df = df.filter(df["Verification Status"] == "Pass")
-    print("call")
-    print(df.count())
     
+    #test_df = df.withColumn("pts",to_timestamp(col("Call Start Time"),"M-d-yyyy hh:mm)
+      
+    #df = df.withColumn("_raw_ts", col("Call Start Time"))
     df = normalize_timestamp(df, "Call Start Time")
-    print(df.count())
+    #df = df.withColumn("event_ts",to_timestamp(col("Call Start Time"),"M-d-yyyy hh:mm"))
+
+    #if debug_path:
+    #    df.select(
+    #        col("Customer No (CTI)").alias("user_id"),
+    #        "_raw_ts",
+    #        "event_ts"
+    #    ).coalesce(1).write.mode("overwrite").option("header", True).csv(debug_path)
+    #    print(f"Call debug CSV written to: {debug_path}")
 
     return df.select(col("Customer No (CTI)").alias("user_id"),
                      "event_ts",
@@ -174,11 +174,7 @@ def read_chat(path):
     df = spark.read.option("header", True).csv(path)
     df = df.filter(col("Pre/Post") == "Postlogin")
     df = df.withColumn("_ts", concat_ws(" ", col("Date7"), col("StartTime")))
-    df = df.filter(col("REL ID").isNotNull()&(trim(col("REL ID")) != ""))
-    print("chat")
-    print(df.count())
     df = normalize_timestamp(df, "_ts")
-    print(df.count())
     return df.select(col("REL ID").alias("user_id"),
                      "event_ts",
                      lit("Chat").alias("channel"))
@@ -220,16 +216,6 @@ df = combined_df.withColumn("rn", row_number().over(w))
 starter_df = df.filter(col("rn") == 1).select("user_id", col("channel").alias("starter_channel"))
 df = df.join(starter_df, "user_id")
 
-# ---------------- DEBUG: Write windowed data to CSV ----------------
-debug_windowed_path = f"/user/2030435/CallCentreAnalystics/debug_windowed_{mnth}.csv"
-df.select("user_id", "event_ts", "channel", "rn", "starter_channel") \
-    .orderBy("user_id", "rn") \
-    .coalesce(1) \
-    .write.mode("overwrite") \
-    .option("header", True) \
-    .csv(debug_windowed_path)
-print(f"Debug windowed data written to: {debug_windowed_path}")
-
 # ---------------- TOTAL + REP RATE ----------------
 agg_df = df.groupBy("starter_channel").agg(
     count("*").alias("total_case"),
@@ -261,34 +247,23 @@ bucket_pivot = (
     .withColumnRenamed("3+", "follow_up_3+")
 )
 
-# ---------------- SECOND / THIRD CHANNEL (CORRECTED) ----------------
-def top_contact_after_starter(df, prefix, top_n=4):
-    """
-    Get top N channels contacted after the starter channel.
-    For second contact: all contacts with rn >= 2
-    For third contact: all contacts with rn >= 3
-    """
-    min_rn = 2 if prefix == "sec" else 3
-    
-    after_starter = df.filter(col("rn") >= min_rn)
-    
-    base = after_starter.groupBy("starter_channel", "channel") \
-                       .agg(countDistinct("user_id").alias("user_count"))
-    
+# ---------------- SECOND / THIRD CHANNEL (FIXED) ----------------
+def top_contact_fixed(df, rn, prefix, top_n=4):
+    nth_df = df.filter(col("rn") == rn)
+    base = nth_df.groupBy("starter_channel", "channel") \
+                 .agg(countDistinct("user_id").alias("user_count"))
     w = Window.partitionBy("starter_channel").orderBy(col("user_count").desc())
     ranked = base.withColumn("rank", row_number().over(w)).filter(col("rank") <= top_n)
-    
     exprs = []
     for i in range(1, top_n + 1):
         exprs += [
             max(when(col("rank") == i, col("channel"))).alias(f"{prefix}_chnl_{i}"),
             max(when(col("rank") == i, col("user_count"))).alias(f"{prefix}_chnl_count_{i}")
         ]
-    
     return ranked.groupBy("starter_channel").agg(*exprs)
 
-sec_df = top_contact_after_starter(df, "sec")
-third_df = top_contact_after_starter(df, "third")
+sec_df = top_contact_fixed(df, 2, "sec")
+third_df = top_contact_fixed(df, 3, "third")
 
 # ---------------- FINAL JOIN ----------------
 final_df = (
