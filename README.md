@@ -8,7 +8,7 @@ from functools import reduce
 # SPARK SESSION
 # --------------------------------------------------
 spark = SparkSession.builder \
-    .appName("CallCentreAnalytics") \
+    .appName("CallChatMultiContactAnalysis") \
     .getOrCreate()
 
 # --------------------------------------------------
@@ -40,11 +40,25 @@ def read_call(path, part):
     df = spark.read.option("header", True).csv(path)
     return (
         df.filter(col("Customer No (CTI)").isNotNull())
-          .withColumn("mnth", lit(part))
           .select(
               col("Customer No (CTI)").alias("user_id"),
-              col("Primary Call Type"),
-              col("Secondary Call Type")
+              lit("Call").alias("channel"),
+              col("Primary Call Type").alias("primary_nature"),
+              col("Secondary Call Type").alias("secondary_nature"),
+              lit(part).alias("mnth")
+          )
+    )
+
+def read_chat(path, part):
+    df = spark.read.option("header", True).csv(path)
+    return (
+        df.filter(col("REL ID").isNotNull())
+          .select(
+              col("REL ID").alias("user_id"),
+              lit("Chat").alias("channel"),
+              lit(None).cast("string").alias("primary_nature"),
+              lit(None).cast("string").alias("secondary_nature"),
+              lit(part).alias("mnth")
           )
     )
 
@@ -68,51 +82,62 @@ def safe_read(func, part, path):
 dfs = []
 
 for part, mnth in months.items():
+
     call_path = f"/user/2030435/CallCentreAnalystics/{mnth}_call.csv"
-    df = safe_read(read_call, part, call_path)
-    if df is not None:
-        dfs.append(df)
+    chat_path = f"/user/2030435/CallCentreAnalystics/{mnth}_chat.csv"
+
+    call_df = safe_read(read_call, part, call_path)
+    chat_df = safe_read(read_chat, part, chat_path)
+
+    if call_df is not None:
+        dfs.append(call_df)
+
+    if chat_df is not None:
+        dfs.append(chat_df)
 
 # --------------------------------------------------
-# UNION ALL DATA
+# UNION ALL
 # --------------------------------------------------
-if dfs:
-    combined_df = reduce(lambda d1, d2: d1.unionByName(d2), dfs)
-else:
-    combined_df = spark.createDataFrame([], StructType([]))
+if not dfs:
+    raise ValueError("No data found")
+
+combined_df = reduce(lambda d1, d2: d1.unionByName(d2), dfs).cache()
 
 # --------------------------------------------------
-# AGGREGATION
+# USER × CHANNEL AGGREGATION
 # --------------------------------------------------
-agg_df = combined_df.groupBy("user_id").agg(
+agg_df = combined_df.groupBy("user_id", "channel").agg(
     count("*").alias("contact_count"),
-    collect_set("Primary Call Type").alias("Prim_call_type"),
-    collect_list("Secondary Call Type").alias("Sec_call_type")
+    collect_set("primary_nature").alias("primary_nature"),
+    collect_set("secondary_nature").alias("secondary_nature")
 )
 
 # --------------------------------------------------
-# FILTER MULTIPLE CONTACT USERS
+# FILTER MULTI-CONTACT USERS
 # --------------------------------------------------
 final_df = agg_df.filter(col("contact_count") > 1)
 
 # --------------------------------------------------
 # ARRAY → STRING (CSV SAFE)
 # --------------------------------------------------
-final_df = final_df \
-    .withColumn("Prim_call_type", concat_ws("|", col("Prim_call_type"))) \
-    .withColumn("Sec_call_type", concat_ws("|", col("Sec_call_type")))
-
-final_df = final_df.filter(
-  col("Prim_call_type").isNotNull() &
-  col("Sec_call_type").isNotNull() &
-  (trim(col("Prim_call_type")) !="")&
-  (trim(col("Sec_call_type")) !="")
+final_df = (
+    final_df
+    .withColumn("primary_nature", concat_ws("|", col("primary_nature")))
+    .withColumn("secondary_nature", concat_ws("|", col("secondary_nature")))
 )
 
 # --------------------------------------------------
-# WRITE SINGLE CSV FILE
+# OPTIONAL CLEANUP (REMOVE EMPTY)
 # --------------------------------------------------
-OUTPUT_DIR = "/user/2030435/CallCentreAnalystics/CallNature"
+final_df = final_df.filter(
+    (trim(col("user_id")) != "") &
+    (trim(col("channel")) != "")
+)
+
+# --------------------------------------------------
+# WRITE OUTPUT
+# --------------------------------------------------
+OUTPUT_DIR = "/user/2030435/CallCentreAnalystics/CallChatNature"
 
 final_df.coalesce(1) \
     .write \
@@ -121,7 +146,7 @@ final_df.coalesce(1) \
     .csv(OUTPUT_DIR)
 
 # --------------------------------------------------
-# RENAME part file → FIXED NAME
+# RENAME part FILE
 # --------------------------------------------------
 fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
     spark._jsc.hadoopConfiguration()
@@ -135,9 +160,6 @@ for f in fs.listStatus(path):
         fs.rename(
             f.getPath(),
             spark._jvm.org.apache.hadoop.fs.Path(
-                OUTPUT_DIR + "/CallNatureDF.csv"
+                OUTPUT_DIR + "/CallChatMultiContact.csv"
             )
         )
-"To Understand whether customer had mulitple contacts over past few months or within a single months across different channel. If yes, what are the call / livechat nature ? (call we have nature )
-Agent Chat - look up the the interaction from Daily Chat Nature ( column F to get the nature ) 
-Chat - will not hav ethe nature "
