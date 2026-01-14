@@ -8,7 +8,7 @@ from functools import reduce
 # SPARK SESSION
 # --------------------------------------------------
 spark = SparkSession.builder \
-    .appName("CallChatNatureAnalytics") \
+    .appName("CallChatStacyNatureAnalytics") \
     .getOrCreate()
 
 # --------------------------------------------------
@@ -24,16 +24,10 @@ months = {
 # --------------------------------------------------
 # HDFS HELPERS
 # --------------------------------------------------
-hadoop_fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
-    spark._jsc.hadoopConfiguration()
-)
-
+hadoop_fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
 def path_exists(p):
     return hadoop_fs.exists(spark._jvm.org.apache.hadoop.fs.Path(p))
 
-# --------------------------------------------------
-# SAFE READ
-# --------------------------------------------------
 def safe_read(func, path, part):
     try:
         if path_exists(path):
@@ -87,10 +81,7 @@ def read_chat(path, part):
 # READ CHAT NATURE
 # --------------------------------------------------
 def read_chat_nature(path, part):
-    df = spark.read.option("header", "false") \
-                   .option("inferSchema", "true") \
-                   .csv(path)
-    # assume 3rd row has headers
+    df = spark.read.option("header", "false").option("inferSchema", "true").csv(path)
     new_header = df.limit(3).collect()[2]
     df_data = df.rdd.zipWithIndex().filter(lambda x: x[1] > 3).map(lambda x: x[0]).toDF()
     df_final = df_data.toDF(*new_header)
@@ -107,46 +98,84 @@ def read_chat_nature(path, part):
     )
 
 # --------------------------------------------------
+# READ STACY (both en_post and zh_post)
+# --------------------------------------------------
+def read_stacy(path, part):
+    df = spark.read.option("header", True).csv(path)
+    return (
+        df.filter(col("UserId").isNotNull())
+          .withColumn("mnth", lit(part))
+          .withColumn("channel", lit("Stacy"))
+          .withColumn("primary_nature", lit(None).cast("string"))
+          .withColumn("secondary_nature", lit(None).cast("string"))
+          .withColumn("chat_nature", lit(None).cast("string"))
+          .select(
+              col("UserId").alias("user_id"),
+              "channel",
+              "primary_nature",
+              "secondary_nature",
+              "chat_nature",
+              "mnth"
+          )
+    )
+
+# --------------------------------------------------
 # READ AND UNION ALL MONTHS
 # --------------------------------------------------
-call_dfs, chat_dfs, chat_nature_dfs = [], [], []
+call_dfs, chat_dfs, chat_nature_dfs, stacy_dfs = [], [], [], []
 
 for part, mnth in months.items():
+    # Paths
     call_path = f"/user/2030435/CallCentreAnalystics/{mnth}_call.csv"
     chat_path = f"/user/2030435/CallCentreAnalystics/{mnth}_chat.csv"
     chat_nature_path = f"/user/2030435/CallCentreAnalystics/{mnth}_chat_nature.csv"
+    stacy_patterns = [f"{mnth}_stacy_en_post.csv", f"{mnth}_stacy_zh_post.csv"]
 
+    # Call
     df = safe_read(read_call, call_path, part)
     if df is not None: call_dfs.append(df)
 
+    # Chat
     df = safe_read(read_chat, chat_path, part)
     if df is not None: chat_dfs.append(df)
 
+    # Chat Nature
     df = safe_read(read_chat_nature, chat_nature_path, part)
     if df is not None: chat_nature_dfs.append(df)
 
-# UNION
-call_df = reduce(lambda d1, d2: d1.unionByName(d2), call_dfs) if call_dfs else spark.createDataFrame([], StructType([]))
-chat_df = reduce(lambda d1, d2: d1.unionByName(d2), chat_dfs) if chat_dfs else spark.createDataFrame([], StructType([]))
-chat_nature_df = reduce(lambda d1, d2: d1.unionByName(d2), chat_nature_dfs) if chat_nature_dfs else spark.createDataFrame([], StructType([]))
+    # Stacy EN + ZH
+    stacy_month_dfs = []
+    for stacy_file in stacy_patterns:
+        stacy_path = f"/user/2030435/CallCentreAnalystics/{stacy_file}"
+        df = safe_read(read_stacy, stacy_path, part)
+        if df is not None: stacy_month_dfs.append(df)
+    if stacy_month_dfs:
+        stacy_dfs.append(reduce(lambda d1,d2: d1.unionByName(d2), stacy_month_dfs))
 
+# --------------------------------------------------
+# UNION ALL
+# --------------------------------------------------
+call_df = reduce(lambda d1,d2: d1.unionByName(d2), call_dfs) if call_dfs else spark.createDataFrame([], StructType([]))
+chat_df = reduce(lambda d1,d2: d1.unionByName(d2), chat_dfs) if chat_dfs else spark.createDataFrame([], StructType([]))
+chat_nature_df = reduce(lambda d1,d2: d1.unionByName(d2), chat_nature_dfs) if chat_nature_dfs else spark.createDataFrame([], StructType([]))
+stacy_df = reduce(lambda d1,d2: d1.unionByName(d2), stacy_dfs) if stacy_dfs else spark.createDataFrame([], StructType([]))
+
+# --------------------------------------------------
 # JOIN CHAT + NATURE
-chat_df = chat_df.join(chat_nature_df, on=["num_id","mnth","channel"], how="left")
-
-# DROP num_id now
-chat_df = chat_df.drop("num_id")
+# --------------------------------------------------
+chat_df = chat_df.join(chat_nature_df, on=["num_id","mnth","channel"], how="left").drop("num_id")
 
 # --------------------------------------------------
-# COMBINE CALL + CHAT
+# COMBINE CALL, CHAT, STACY
 # --------------------------------------------------
-combined_df = call_df.unionByName(chat_df, allowMissingColumns=True)
+combined_df = call_df.unionByName(chat_df, allowMissingColumns=True).unionByName(stacy_df, allowMissingColumns=True)
 
 # --------------------------------------------------
-# MAKE SURE ALL NATURE COLUMNS EXIST
+# ENSURE NATURE COLUMNS EXIST
 # --------------------------------------------------
-for c in ["primary_nature", "secondary_nature", "chat_nature"]:
+for c in ["primary_nature","secondary_nature","chat_nature"]:
     if c not in combined_df.columns:
-        combined_df = combined_df.withColumn(c, array().cast("array<string>"))
+        combined_df = combined_df.withColumn(c, lit(None).cast("string"))
 
 # --------------------------------------------------
 # AGGREGATE PER USER + CHANNEL
@@ -158,30 +187,23 @@ agg_df = combined_df.groupBy("user_id","channel").agg(
     collect_set("chat_nature").alias("chat_nature")
 )
 
-# --------------------------------------------------
-# CONVERT ARRAYS → STRING
-# --------------------------------------------------
+# ARRAY → STRING
 agg_df = agg_df \
     .withColumn("primary_nature", concat_ws("|", col("primary_nature"))) \
     .withColumn("secondary_nature", concat_ws("|", col("secondary_nature"))) \
     .withColumn("chat_nature", concat_ws("|", col("chat_nature")))
 
 # --------------------------------------------------
-# WRITE RESULT
+# WRITE FINAL CSV
 # --------------------------------------------------
-OUTPUT_DIR = "/user/2030435/CallCentreAnalystics/CombinedCallChatNature"
+OUTPUT_DIR = "/user/2030435/CallCentreAnalystics/CombinedCallChatStacyNature"
 
 agg_df.coalesce(1).write.mode("overwrite").option("header", True).csv(OUTPUT_DIR)
 
-# --------------------------------------------------
 # RENAME PART FILE
-# --------------------------------------------------
 fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(spark._jsc.hadoopConfiguration())
 path = spark._jvm.org.apache.hadoop.fs.Path(OUTPUT_DIR)
 for f in fs.listStatus(path):
     name = f.getPath().getName()
     if name.startswith("part-") and name.endswith(".csv"):
-        fs.rename(
-            f.getPath(),
-            spark._jvm.org.apache.hadoop.fs.Path(OUTPUT_DIR + "/CombinedCallChatNatureDF.csv")
-        )
+        fs.rename(f.getPath(), spark._jvm.org.apache.hadoop.fs.Path(OUTPUT_DIR + "/CombinedCallChatStacyNatureDF.csv"))
