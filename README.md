@@ -8,8 +8,8 @@ spark = SparkSession.builder.appName("xxxx").enableHiveSupport().getOrCreate()
 spark.conf.set("spark.sql.legacy.timeParserPolicy", "LEGACY")
 
 # ---------------- CONFIG ----------------
-mnth = "mar"
-part = "202503"
+mnth = "nov"
+part = "202511"
 
 stacy_cnt = ["en", "zh"]
 stacy_auth = ["post"]
@@ -25,7 +25,8 @@ def path_exists(p):
 # ---------------- TIMESTAMP NORMALIZER ----------------
 def normalize_timestamp(df, ts_col):
     if ts_col == "Call Start Time":
-      df = df.withColumn("_ts", trim(col(ts_col)))
+      #df = df.withColumn("_ts", trim(col(ts_col)))
+      df = df.withColumn("_ts", regexp_replace(trim(col(ts_col)),r"\s+"," "))
     
       df = df.withColumn(
           "_ts",
@@ -57,12 +58,12 @@ def normalize_timestamp(df, ts_col):
           "d-M-yyyy HH:mm:ss", "d-M-yyyy hh:mm:ss a",
           "d-M-yy HH:mm", "d-M-yy hh:mm a",
           "d-M-yyyy HH:mm", "d-M-yyyy hh:mm a",
+          "dd/MM/yyyy hh:mm a", "dd/MM/yyyy hh:mm:ss a",
+          "dd/MM/yy hh:mm a", "dd/MM/yy hh:mm:ss a",
           "M-d-yy HH:mm:ss", "M-d-yyyy HH:mm:ss",
           "M-d-yy HH:mm", "M-d-yyyy HH:mm",
           "M-d-yy HH:mm:ss a", "M-d-yyyy HH:mm:ss a",
           "M-d-yy HH:mm a", "M-d-yyyy HH:mm a",
-          "dd/MM/yyyy hh:mm a", "dd/MM/yyyy hh:mm:ss a",
-          "dd/MM/yy hh:mm a", "dd/MM/yy hh:mm:ss a",
           "M/d/yy hh:mm a", "MM/dd/yy hh:mm a",
           "M/d/yyyy hh:mm a", "MM/dd/yyyy hh:mm a",
           "M/d/yy hh:mm:ss a", "MM/dd/yy hh:mm:ss a",
@@ -96,12 +97,12 @@ def normalize_timestamp(df, ts_col):
           "d-M-yyyy HH:mm:ss", "d-M-yyyy hh:mm:ss a",
           "d-M-yy HH:mm", "d-M-yy hh:mm a",
           "d-M-yyyy HH:mm", "d-M-yyyy hh:mm a",
+          "dd/MM/yyyy hh:mm a", "dd/MM/yyyy hh:mm:ss a",
+          "dd/MM/yy hh:mm a", "dd/MM/yy hh:mm:ss a",
           "M-d-yy HH:mm:ss", "M-d-yyyy HH:mm:ss",
           "M-d-yy HH:mm", "M-d-yyyy HH:mm",
           "M-d-yy HH:mm:ss a", "M-d-yyyy HH:mm:ss a",
           "M-d-yy HH:mm a", "M-d-yyyy HH:mm a",
-          "dd/MM/yyyy hh:mm a", "dd/MM/yyyy hh:mm:ss a",
-          "dd/MM/yy hh:mm a", "dd/MM/yy hh:mm:ss a",
           "M/d/yy hh:mm a", "MM/dd/yy hh:mm a",
           "M/d/yyyy hh:mm a", "MM/dd/yyyy hh:mm a",
           "M/d/yy hh:mm:ss a", "MM/dd/yy hh:mm:ss a",
@@ -136,8 +137,8 @@ def read_stacy(path):
     ts_col = "HKT" if "HKT" in df.columns else "date (UTC)"
     user_col = "user_id" if "user_id" in df.columns else "customer_id"
     df = df.filter(col(user_col).isNotNull()&(trim(col(user_col)) != ""))
-    #print("Stacy")
-    #print(df.count())
+    print("Stacy")
+    print(df.count())
     df = normalize_timestamp(df, ts_col)
     return df.select(col(user_col).alias("user_id"),
                      "event_ts",
@@ -147,8 +148,8 @@ def read_ivr(path):
     df = spark.read.option("header", True).csv(path)
     df = df.filter(col("ONE_FA").isin(post_login_values))
     df = df.filter(col("REL_ID").isNotNull()&(trim(col("REL_ID")) != ""))
-    #print("ivr")
-    #print(df.count())
+    print("ivr")
+    print(df.count())
     df = normalize_timestamp(df, "STARTTIME")
     return df.select(col("REL_ID").alias("user_id"),
                      "event_ts",
@@ -161,8 +162,8 @@ def read_call(path, debug_path=None):
       )
     df = df.withColumn("raw_ts",col("Call Start Time"))
     df = df.filter(df["Verification Status"] == "Pass")
-    #print("call")
-    #print(df.count())
+    print("call")
+    print(df.count())
     
     df = normalize_timestamp(df, "Call Start Time")
     df.select( col("Customer No (CTI)").alias("user_id"),"raw_ts","event_ts").coalesce(1).write.mode("overwrite").csv(f"/user/2030435/CallCentreAnalystics/0001.csv")
@@ -176,8 +177,8 @@ def read_chat(path):
     df = df.filter(col("Pre/Post") == "Postlogin")
     df = df.withColumn("_ts", concat_ws(" ", col("Date7"), col("StartTime")))
     df = df.filter(col("REL ID").isNotNull()&(trim(col("REL ID")) != ""))
-    #print("chat")
-    #print(df.count())
+    print("chat")
+    print(df.count())
     df = normalize_timestamp(df, "_ts")
     return df.select(col("REL ID").alias("user_id"),
                      "event_ts",
@@ -199,7 +200,7 @@ for i in range(1, 5):
 
 # Call with debug CSV
 call_debug_path = f"/user/2030435/CallCentreAnalystics/debug_call_{mnth}.csv"
-df = safe_read(lambda path: read_call(path, debug_path=call_debug_path),
+df = safe_read(read_call,
                f"/user/2030435/CallCentreAnalystics/{mnth}_call.csv")
 if df: dfs.append(df)
 
@@ -281,10 +282,13 @@ final_df = (
     .withColumnRenamed("starter_channel", "Channel")
     .withColumn("Date", lit(part))
 )
+final_df = (
+  final_df.withColumn("total_postlogin_contact",lit(total_postlogin_cases)).withColumn("total_distinct_users",lit(total_distinct_users))
+)
 
 # ---------------- FIX OUTPUT SCHEMA ----------------
 columns = [
-    "Date", "Channel", "total_case", "uniq_cust", "rep_rate",
+    "Date", "Channel","total_postlogin_contact","total_distinct_users", "total_case", "uniq_cust", "rep_rate",
     "follow_up_0", "follow_up_1", "follow_up_2", "follow_up_3+",
     "sec_chnl_1", "sec_chnl_2", "sec_chnl_3", "sec_chnl_4",
     "sec_chnl_count_1", "sec_chnl_count_2", "sec_chnl_count_3", "sec_chnl_count_4",
