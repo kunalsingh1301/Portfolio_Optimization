@@ -1,137 +1,143 @@
-# ============================================================
-# 1️⃣ MONTHLY FIRST CONTACT (CUSTOMER LEVEL)
-# ============================================================
-month_w = Window.partitionBy("user_id").orderBy("event_ts")
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StructType
+from pyspark.sql.functions import *
+from pyspark.sql.utils import AnalysisException
+from functools import reduce
 
-first_contact_df = (
-    combined_df
-    .withColumn("rn_month", row_number().over(month_w))
-    .filter(col("rn_month") == 1)
-    .groupBy("channel")
-    .agg(countDistinct("user_id").alias("first_contact_customers"))
+# --------------------------------------------------
+# SPARK SESSION
+# --------------------------------------------------
+spark = SparkSession.builder \
+    .appName("CallCentreAnalytics") \
+    .getOrCreate()
+
+# --------------------------------------------------
+# MONTH CONFIG
+# --------------------------------------------------
+months = {
+    '202501': 'jan', '202502': 'feb', '202503': 'mar',
+    '202504': 'apr', '202505': 'may', '202506': 'jun',
+    '202507': 'jul', '202508': 'aug', '202509': 'sep',
+    '202510': 'oct', '202511': 'nov'
+}
+
+# --------------------------------------------------
+# HDFS HELPERS
+# --------------------------------------------------
+hadoop_fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
+    spark._jsc.hadoopConfiguration()
 )
 
-# ============================================================
-# 2️⃣ CASE CONSTRUCTION (CASE LEVEL)
-# ============================================================
-w_user = Window.partitionBy("user_id").orderBy("event_ts")
-
-df = combined_df.withColumn("rn", row_number().over(w_user))
-
-starter_df = (
-    df.filter(col("rn") == 1)
-      .select("user_id", col("channel").alias("starter_channel"))
-)
-
-df = df.join(starter_df, "user_id")
-
-df = df.withColumn(
-    "case_id",
-    sum(when(col("rn") == 1, 1).otherwise(0)).over(w_user)
-)
-
-# ============================================================
-# 3️⃣ CASE SIZE
-# ============================================================
-case_df = (
-    df.groupBy("starter_channel", "user_id", "case_id")
-      .agg(count("*").alias("case_size"))
-)
-
-# ============================================================
-# 4️⃣ TOTAL CASES + CUSTOMERS PER STARTER CHANNEL
-# ============================================================
-total_case_df = (
-    case_df.groupBy("starter_channel")
-    .agg(
-        count("*").alias("total_case"),
-        countDistinct("user_id").alias("starter_customers")
+def path_exists(p):
+    return hadoop_fs.exists(
+        spark._jvm.org.apache.hadoop.fs.Path(p)
     )
-)
 
-# ============================================================
-# 5️⃣ FOLLOW-UP BUCKETS (CASE LEVEL)
-# ============================================================
-bucket_df = case_df.withColumn(
-    "bucket",
-    when(col("case_size") == 1, "0")
-    .when(col("case_size") == 2, "1")
-    .when(col("case_size") == 3, "2")
-    .otherwise("3+")
-)
-
-bucket_pivot = (
-    bucket_df.groupBy("starter_channel", "bucket")
-    .count()
-    .groupBy("starter_channel")
-    .pivot("bucket", ["0", "1", "2", "3+"])
-    .sum("count")
-    .fillna(0)
-    .withColumnRenamed("0", "follow_up_0")
-    .withColumnRenamed("1", "follow_up_1")
-    .withColumnRenamed("2", "follow_up_2")
-    .withColumnRenamed("3+", "follow_up_3+")
-)
-
-# ============================================================
-# 6️⃣ REPEAT RATE (CUSTOMER LEVEL – CORRECTED)
-# ============================================================
-cust_case_cnt = (
-    case_df.groupBy("starter_channel", "user_id")
-    .agg(count("*").alias("cases_started"))
-)
-
-repeat_df = (
-    cust_case_cnt.filter(col("cases_started") > 1)
-    .groupBy("starter_channel")
-    .agg(countDistinct("user_id").alias("repeat_customers"))
-)
-
-rep_df = (
-    total_case_df
-    .join(repeat_df, "starter_channel", "left")
-    .fillna(0)
-    .withColumn("rep_rate", col("repeat_customers") * 100 / col("starter_customers"))
-)
-
-# ============================================================
-# 7️⃣ 2ND / 3RD CONTACT CHANNEL (CASE LEVEL)
-# ============================================================
-def top_channel(df, rn, prefix):
-    base = (
-        df.filter(col("rn") == rn)
-        .groupBy("starter_channel", "channel")
-        .agg(countDistinct(struct("user_id", "case_id")).alias("case_count"))
+# --------------------------------------------------
+# READERS
+# --------------------------------------------------
+def read_call(path, part):
+    df = spark.read.option("header", True).csv(path)
+    return (
+        df.filter(col("Customer No (CTI)").isNotNull())
+          .withColumn("mnth", lit(part))
+          .select(
+              col("Customer No (CTI)").alias("user_id"),
+              col("Primary Call Type"),
+              col("Secondary Call Type")
+          )
     )
-    w = Window.partitionBy("starter_channel").orderBy(col("case_count").desc())
-    ranked = base.withColumn("rank", row_number().over(w)).filter(col("rank") <= 4)
 
-    exprs = []
-    for i in range(1, 5):
-        exprs += [
-            max(when(col("rank") == i, col("channel"))).alias(f"{prefix}_chnl_{i}"),
-            max(when(col("rank") == i, col("case_count"))).alias(f"{prefix}_chnl_count_{i}")
-        ]
+def safe_read(func, part, path):
+    try:
+        if path_exists(path):
+            df = func(path, part)
+            if not df.rdd.isEmpty():
+                return df
+        else:
+            print(f"Missing: {path}")
+    except AnalysisException as e:
+        print(f"AnalysisException: {e}")
+    except Exception as e:
+        print(f"Exception: {e}")
+    return None
 
-    return ranked.groupBy("starter_channel").agg(*exprs)
+# --------------------------------------------------
+# READ ALL MONTHS
+# --------------------------------------------------
+dfs = []
 
-sec_df = top_channel(df, 2, "sec")
-third_df = top_channel(df, 3, "third")
+for part, mnth in months.items():
+    call_path = f"/user/2030435/CallCentreAnalystics/{mnth}_call.csv"
+    df = safe_read(read_call, part, call_path)
+    if df is not None:
+        dfs.append(df)
 
-# ============================================================
-# 8️⃣ FINAL OUTPUT
-# ============================================================
-final_df = (
-    rep_df
-    .join(bucket_pivot, "starter_channel")
-    .join(sec_df, "starter_channel", "left")
-    .join(third_df, "starter_channel", "left")
-    .withColumnRenamed("starter_channel", "Channel")
-    .withColumn("Date", lit(part))
-    .withColumn("total_postlogin_cases", lit(total_postlogin_cases))
-    .withColumn("total_distinct_users", lit(total_distinct_users))
+# --------------------------------------------------
+# UNION ALL DATA
+# --------------------------------------------------
+if dfs:
+    combined_df = reduce(lambda d1, d2: d1.unionByName(d2), dfs)
+else:
+    combined_df = spark.createDataFrame([], StructType([]))
+
+# --------------------------------------------------
+# AGGREGATION
+# --------------------------------------------------
+agg_df = combined_df.groupBy("user_id").agg(
+    count("*").alias("contact_count"),
+    collect_set("Primary Call Type").alias("Prim_call_type"),
+    collect_list("Secondary Call Type").alias("Sec_call_type")
 )
 
-final_df.show(truncate=False)
-✅ GUARANTEED PROPERTIES (NOW TRUE)
-✔ follow_up_0 + 1 + 2 + 3+ = total_case
+# --------------------------------------------------
+# FILTER MULTIPLE CONTACT USERS
+# --------------------------------------------------
+final_df = agg_df.filter(col("contact_count") > 1)
+
+# --------------------------------------------------
+# ARRAY → STRING (CSV SAFE)
+# --------------------------------------------------
+final_df = final_df \
+    .withColumn("Prim_call_type", concat_ws("|", col("Prim_call_type"))) \
+    .withColumn("Sec_call_type", concat_ws("|", col("Sec_call_type")))
+
+final_df = final_df.filter(
+  col("Prim_call_type").isNotNull() &
+  col("Sec_call_type").isNotNull() &
+  (trim(col("Prim_call_type")) !="")&
+  (trim(col("Sec_call_type")) !="")
+)
+
+# --------------------------------------------------
+# WRITE SINGLE CSV FILE
+# --------------------------------------------------
+OUTPUT_DIR = "/user/2030435/CallCentreAnalystics/CallNature"
+
+final_df.coalesce(1) \
+    .write \
+    .mode("overwrite") \
+    .option("header", True) \
+    .csv(OUTPUT_DIR)
+
+# --------------------------------------------------
+# RENAME part file → FIXED NAME
+# --------------------------------------------------
+fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
+    spark._jsc.hadoopConfiguration()
+)
+
+path = spark._jvm.org.apache.hadoop.fs.Path(OUTPUT_DIR)
+
+for f in fs.listStatus(path):
+    name = f.getPath().getName()
+    if name.startswith("part-") and name.endswith(".csv"):
+        fs.rename(
+            f.getPath(),
+            spark._jvm.org.apache.hadoop.fs.Path(
+                OUTPUT_DIR + "/CallNatureDF.csv"
+            )
+        )
+"To Understand whether customer had mulitple contacts over past few months or within a single months across different channel. If yes, what are the call / livechat nature ? (call we have nature )
+Agent Chat - look up the the interaction from Daily Chat Nature ( column F to get the nature ) 
+Chat - will not hav ethe nature "
