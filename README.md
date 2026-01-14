@@ -1,28 +1,137 @@
-Outcome 3	Flow through across channels (for post login chat / call with customer number only)			
-				
-	# of Cases Handled	Monthly Volume (Sep24)	Definition 	
-	First Contacted by : Stacy	155,364 	Customer first reach channel	
-	Live Chat	57,242 	First contact channel by a customer in a calendar month (e.g. customer first contact in Nov - only for Post login ) 	
-	Call	261 		
-	IVR	97,861 		
-				
-	Case Start with Stacy	Monthly Volume (Sep24)		
-	# total no. of cases			total no. of cases across stacy/call/chat with customer ids
-	# total no. of customers			total no. of unique customer across stacy/call/chat
-	# of Cases	57,242 	how many contact start with stacy	# uqinue Chats 
-	# of Customers	46,552 	how many customer start with stacy	# unique Customers
-	Repeated Rate	50%		# Customers Repeat chat initiation ( Avg chat per customers )
-	# of cases with follow up = 0	28,548 	After customer reach out to stacy, no 2nd chat/ call	chat/call/stacy
-	1	12,778 	After customer reach out to stacy, find livechat / call	
-	2	7,127 		
-	3+	8,789 		
-				
-	2nd Contact Channel			
-	Stacy	7,855 	After customer reach out to stacy, come back again to Stacy	# Unique chats by the same customer across different cahnnels but initiated via Stacy
-	Live Chat	16,177 	After customer reach out to stacy, passed to livechat	
-	Call	4,662 	After customer reach out to stacy, passed to Call	
-	IVR		After customer reach out to stacy, passed to IVR	
-				
-	Case Start with Livechat (same rules for case 43)			
-	Case Start with Call(same rules for case 43)			
-	Case Start with IVR(same rules for case 43)			
+# ============================================================
+# 1️⃣ MONTHLY FIRST CONTACT (CUSTOMER LEVEL)
+# ============================================================
+month_w = Window.partitionBy("user_id").orderBy("event_ts")
+
+first_contact_df = (
+    combined_df
+    .withColumn("rn_month", row_number().over(month_w))
+    .filter(col("rn_month") == 1)
+    .groupBy("channel")
+    .agg(countDistinct("user_id").alias("first_contact_customers"))
+)
+
+# ============================================================
+# 2️⃣ CASE CONSTRUCTION (CASE LEVEL)
+# ============================================================
+w_user = Window.partitionBy("user_id").orderBy("event_ts")
+
+df = combined_df.withColumn("rn", row_number().over(w_user))
+
+starter_df = (
+    df.filter(col("rn") == 1)
+      .select("user_id", col("channel").alias("starter_channel"))
+)
+
+df = df.join(starter_df, "user_id")
+
+df = df.withColumn(
+    "case_id",
+    sum(when(col("rn") == 1, 1).otherwise(0)).over(w_user)
+)
+
+# ============================================================
+# 3️⃣ CASE SIZE
+# ============================================================
+case_df = (
+    df.groupBy("starter_channel", "user_id", "case_id")
+      .agg(count("*").alias("case_size"))
+)
+
+# ============================================================
+# 4️⃣ TOTAL CASES + CUSTOMERS PER STARTER CHANNEL
+# ============================================================
+total_case_df = (
+    case_df.groupBy("starter_channel")
+    .agg(
+        count("*").alias("total_case"),
+        countDistinct("user_id").alias("starter_customers")
+    )
+)
+
+# ============================================================
+# 5️⃣ FOLLOW-UP BUCKETS (CASE LEVEL)
+# ============================================================
+bucket_df = case_df.withColumn(
+    "bucket",
+    when(col("case_size") == 1, "0")
+    .when(col("case_size") == 2, "1")
+    .when(col("case_size") == 3, "2")
+    .otherwise("3+")
+)
+
+bucket_pivot = (
+    bucket_df.groupBy("starter_channel", "bucket")
+    .count()
+    .groupBy("starter_channel")
+    .pivot("bucket", ["0", "1", "2", "3+"])
+    .sum("count")
+    .fillna(0)
+    .withColumnRenamed("0", "follow_up_0")
+    .withColumnRenamed("1", "follow_up_1")
+    .withColumnRenamed("2", "follow_up_2")
+    .withColumnRenamed("3+", "follow_up_3+")
+)
+
+# ============================================================
+# 6️⃣ REPEAT RATE (CUSTOMER LEVEL – CORRECTED)
+# ============================================================
+cust_case_cnt = (
+    case_df.groupBy("starter_channel", "user_id")
+    .agg(count("*").alias("cases_started"))
+)
+
+repeat_df = (
+    cust_case_cnt.filter(col("cases_started") > 1)
+    .groupBy("starter_channel")
+    .agg(countDistinct("user_id").alias("repeat_customers"))
+)
+
+rep_df = (
+    total_case_df
+    .join(repeat_df, "starter_channel", "left")
+    .fillna(0)
+    .withColumn("rep_rate", col("repeat_customers") * 100 / col("starter_customers"))
+)
+
+# ============================================================
+# 7️⃣ 2ND / 3RD CONTACT CHANNEL (CASE LEVEL)
+# ============================================================
+def top_channel(df, rn, prefix):
+    base = (
+        df.filter(col("rn") == rn)
+        .groupBy("starter_channel", "channel")
+        .agg(countDistinct(struct("user_id", "case_id")).alias("case_count"))
+    )
+    w = Window.partitionBy("starter_channel").orderBy(col("case_count").desc())
+    ranked = base.withColumn("rank", row_number().over(w)).filter(col("rank") <= 4)
+
+    exprs = []
+    for i in range(1, 5):
+        exprs += [
+            max(when(col("rank") == i, col("channel"))).alias(f"{prefix}_chnl_{i}"),
+            max(when(col("rank") == i, col("case_count"))).alias(f"{prefix}_chnl_count_{i}")
+        ]
+
+    return ranked.groupBy("starter_channel").agg(*exprs)
+
+sec_df = top_channel(df, 2, "sec")
+third_df = top_channel(df, 3, "third")
+
+# ============================================================
+# 8️⃣ FINAL OUTPUT
+# ============================================================
+final_df = (
+    rep_df
+    .join(bucket_pivot, "starter_channel")
+    .join(sec_df, "starter_channel", "left")
+    .join(third_df, "starter_channel", "left")
+    .withColumnRenamed("starter_channel", "Channel")
+    .withColumn("Date", lit(part))
+    .withColumn("total_postlogin_cases", lit(total_postlogin_cases))
+    .withColumn("total_distinct_users", lit(total_distinct_users))
+)
+
+final_df.show(truncate=False)
+✅ GUARANTEED PROPERTIES (NOW TRUE)
+✔ follow_up_0 + 1 + 2 + 3+ = total_case
