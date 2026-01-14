@@ -4,16 +4,16 @@ from pyspark.sql.functions import *
 from pyspark.sql.utils import AnalysisException
 from functools import reduce
 
-# --------------------------------------------------
+# ==================================================
 # SPARK SESSION
-# --------------------------------------------------
+# ==================================================
 spark = SparkSession.builder \
-    .appName("ChatNatureAnalytics") \
+    .appName("UnifiedCallChatNature") \
     .getOrCreate()
 
-# --------------------------------------------------
+# ==================================================
 # MONTH CONFIG
-# --------------------------------------------------
+# ==================================================
 months = {
     '202501': 'jan', '202502': 'feb', '202503': 'mar',
     '202504': 'apr', '202505': 'may', '202506': 'jun',
@@ -21,9 +21,9 @@ months = {
     '202510': 'oct', '202511': 'nov'
 }
 
-# --------------------------------------------------
+# ==================================================
 # HDFS HELPERS
-# --------------------------------------------------
+# ==================================================
 hadoop_fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
     spark._jsc.hadoopConfiguration()
 )
@@ -33,54 +33,6 @@ def path_exists(p):
         spark._jvm.org.apache.hadoop.fs.Path(p)
     )
 
-# --------------------------------------------------
-# READ CHAT
-# --------------------------------------------------
-def read_chat(path, part):
-    df = spark.read.option("header", True).csv(path)
-    return (
-        df.filter(col("Pre/Post") == "Postlogin")
-          .withColumn("mnth", lit(part))
-          .select(
-              col("REL ID").alias("user_id"),
-              col("NumericId").alias("num_id"),
-              col("mnth")
-          )
-    )
-
-# --------------------------------------------------
-# READ CHAT NATURE (FIX BAD HEADER)
-# --------------------------------------------------
-def read_chat_nature(path, part):
-    df = spark.read.option("header", "false") \
-        .option("inferSchema", "true") \
-        .csv(path)
-
-    # 3rd row is the real header
-    new_header = df.limit(3).collect()[2]
-
-    df_data = (
-        df.rdd.zipWithIndex()
-          .filter(lambda x: x[1] > 3)
-          .map(lambda x: x[0])
-          .toDF()
-    )
-
-    df_final = df_data.toDF(*new_header)
-
-    return (
-        df_final
-        .withColumn("mnth", lit(part))
-        .select(
-            col("Numeric ID").alias("num_id"),
-            col("Combine").alias("nature"),
-            col("mnth")
-        )
-    )
-
-# --------------------------------------------------
-# SAFE READ
-# --------------------------------------------------
 def safe_read(func, part, path):
     try:
         if path_exists(path):
@@ -89,103 +41,143 @@ def safe_read(func, part, path):
                 return df
         else:
             print(f"Missing: {path}")
-    except AnalysisException as e:
-        print(f"AnalysisException: {e}")
     except Exception as e:
-        print(f"Exception: {e}")
+        print(e)
     return None
 
-# --------------------------------------------------
+# ==================================================
+# READ CALL
+# ==================================================
+def read_call(path, part):
+    df = spark.read.option("header", True).csv(path)
+    return (
+        df.filter(col("Customer No (CTI)").isNotNull())
+          .select(
+              col("Customer No (CTI)").alias("user_id"),
+              col("Primary Call Type").alias("primary_nature"),
+              col("Secondary Call Type").alias("secondary_nature")
+          )
+          .withColumn("channel", lit("CALL"))
+    )
+
+# ==================================================
+# READ CHAT
+# ==================================================
+def read_chat(path, part):
+    df = spark.read.option("header", True).csv(path)
+    return (
+        df.filter(col("Pre/Post") == "Postlogin")
+          .select(
+              col("REL ID").alias("user_id"),
+              col("NumericId").alias("num_id")
+          )
+          .withColumn("channel", lit("CHAT"))
+          .withColumn("mnth", lit(part))
+    )
+
+# ==================================================
+# READ CHAT NATURE (FIX HEADER)
+# ==================================================
+def read_chat_nature(path, part):
+    df = spark.read.option("header", "false").csv(path)
+    header = df.limit(3).collect()[2]
+
+    df_data = (
+        df.rdd.zipWithIndex()
+          .filter(lambda x: x[1] > 3)
+          .map(lambda x: x[0])
+          .toDF()
+    )
+
+    df_final = df_data.toDF(*header)
+
+    return (
+        df_final
+        .select(
+            col("Numeric ID").alias("num_id"),
+            col("Combine").alias("chat_nature")
+        )
+        .withColumn("mnth", lit(part))
+    )
+
+# ==================================================
 # READ ALL MONTHS
-# --------------------------------------------------
-chat_dfs = []
-nature_dfs = []
+# ==================================================
+call_dfs, chat_dfs, chat_nat_dfs = [], [], []
 
 for part, mnth in months.items():
-    chat_path = f"/user/2030435/CallCentreAnalystics/{mnth}_chat.csv"
-    nature_path = f"/user/2030435/CallCentreAnalystics/{mnth}_chat_nature.csv"
+    call_dfs.append(
+        safe_read(read_call, part, f"/user/2030435/CallCentreAnalystics/{mnth}_call.csv")
+    )
+    chat_dfs.append(
+        safe_read(read_chat, part, f"/user/2030435/CallCentreAnalystics/{mnth}_chat.csv")
+    )
+    chat_nat_dfs.append(
+        safe_read(read_chat_nature, part, f"/user/2030435/CallCentreAnalystics/{mnth}_chat_nature.csv")
+    )
 
-    df = safe_read(read_chat, part, chat_path)
-    if df is not None:
-        chat_dfs.append(df)
+call_df = reduce(lambda a,b: a.unionByName(b), filter(None, call_dfs))
+chat_df = reduce(lambda a,b: a.unionByName(b), filter(None, chat_dfs))
+chat_nat_df = reduce(lambda a,b: a.unionByName(b), filter(None, chat_nat_dfs))
 
-    df = safe_read(read_chat_nature, part, nature_path)
-    if df is not None:
-        nature_dfs.append(df)
-
-# --------------------------------------------------
-# UNION ALL MONTHS
-# --------------------------------------------------
-if chat_dfs:
-    chat_df = reduce(lambda d1, d2: d1.unionByName(d2), chat_dfs)
-else:
-    chat_df = spark.createDataFrame([], StructType([]))
-
-if nature_dfs:
-    nature_df = reduce(lambda d1, d2: d1.unionByName(d2), nature_dfs)
-else:
-    nature_df = spark.createDataFrame([], StructType([]))
-
-# --------------------------------------------------
-# JOIN CHAT + NATURE
-# --------------------------------------------------
-final_df = chat_df.join(
-    nature_df,
-    on=["num_id", "mnth"],
-    how="left"
+# ==================================================
+# CHAT + CHAT NATURE JOIN
+# ==================================================
+chat_full_df = (
+    chat_df.join(chat_nat_df, ["num_id", "mnth"], "left")
+           .drop("num_id", "mnth")
 )
 
-# --------------------------------------------------
-# AGGREGATE PER USER
-# --------------------------------------------------
-agg_df = final_df.groupBy("user_id").agg(
-    count("*").alias("contact_count"),
-    collect_set("nature").alias("natures"),
-    collect_list("mnth").alias("months")
+# ==================================================
+# AGGREGATE CALL (USER × CHANNEL)
+# ==================================================
+call_agg_df = (
+    call_df
+    .groupBy("user_id", "channel")
+    .agg(
+        count("*").alias("contact_count"),
+        collect_set("primary_nature").alias("primary_nature"),
+        collect_set("secondary_nature").alias("secondary_nature")
+    )
+    .withColumn("chat_nature", lit(None))
 )
 
-# --------------------------------------------------
-# FILTER MULTI-CONTACT USERS
-# --------------------------------------------------
-final_df = agg_df.filter(col("contact_count") > 1)
-
-# --------------------------------------------------
-# ARRAY → STRING (CSV SAFE)
-# --------------------------------------------------
-final_df = final_df \
-    .withColumn("natures", concat_ws("|", col("natures"))) \
-    .withColumn("months", concat_ws("|", col("months")))
-
-final_df.filter(
-  col("natures").isNotNull()
+# ==================================================
+# AGGREGATE CHAT (USER × CHANNEL)
+# ==================================================
+chat_agg_df = (
+    chat_full_df
+    .groupBy("user_id", "channel")
+    .agg(
+        count("*").alias("contact_count"),
+        collect_set("chat_nature").alias("chat_nature")
+    )
+    .withColumn("primary_nature", lit(None))
+    .withColumn("secondary_nature", lit(None))
 )
 
-# --------------------------------------------------
-# WRITE SINGLE CSV
-# --------------------------------------------------
-OUTPUT_DIR = "/user/2030435/CallCentreAnalystics/ChatNature"
+# ==================================================
+# UNION CALL + CHAT
+# ==================================================
+final_df = call_agg_df.unionByName(chat_agg_df)
+
+# ==================================================
+# CSV SAFE
+# ==================================================
+final_df = (
+    final_df
+    .withColumn("primary_nature", concat_ws("|", col("primary_nature")))
+    .withColumn("secondary_nature", concat_ws("|", col("secondary_nature")))
+    .withColumn("chat_nature", concat_ws("|", col("chat_nature")))
+)
+
+# ==================================================
+# WRITE OUTPUT
+# ==================================================
+OUTPUT_DIR = "/user/2030435/CallCentreAnalystics/UnifiedCallChatNature"
 
 final_df.coalesce(1) \
     .write \
     .mode("overwrite") \
     .option("header", True) \
     .csv(OUTPUT_DIR)
-
-# --------------------------------------------------
-# RENAME part FILE
-# --------------------------------------------------
-fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
-    spark._jsc.hadoopConfiguration()
-)
-
-path = spark._jvm.org.apache.hadoop.fs.Path(OUTPUT_DIR)
-
-for f in fs.listStatus(path):
-    name = f.getPath().getName()
-    if name.startswith("part-") and name.endswith(".csv"):
-        fs.rename(
-            f.getPath(),
-            spark._jvm.org.apache.hadoop.fs.Path(
-                OUTPUT_DIR + "/ChatNatureDF.csv"
-            )
-        )
