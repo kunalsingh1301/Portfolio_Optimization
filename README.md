@@ -4,185 +4,203 @@ from pyspark.sql.window import Window
 from functools import reduce
 
 # --------------------------------------------------
-# SPARK SESSION
+# SPARK
 # --------------------------------------------------
 spark = SparkSession.builder \
-    .appName("PostLoginFlow_StarterChannel_NoIVR") \
+    .appName("PostLogin_Interaction_Level") \
     .enableHiveSupport() \
     .getOrCreate()
+
+spark.conf.set("spark.sql.legacy.timeParserPolicy", "LEGACY")
 
 # --------------------------------------------------
 # CONFIG
 # --------------------------------------------------
 mnth = "jan"
 part = "202501"
-
-stacy_cnt = ["en", "zh"]
-stacy_auth = ["post"]
+post_login_values = ["OTP|S", "VB|S", "TPIN|S"]
 
 # --------------------------------------------------
-# READERS
+# HDFS SAFE READ
+# --------------------------------------------------
+fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
+    spark._jsc.hadoopConfiguration()
+)
+
+def path_exists(p):
+    return fs.exists(spark._jvm.org.apache.hadoop.fs.Path(p))
+
+def safe_read(reader, path):
+    if path_exists(path):
+        df = reader(path)
+        if not df.rdd.isEmpty():
+            return df
+    return None
+
+# --------------------------------------------------
+# TIMESTAMP NORMALIZER (REUSED AS IS)
+# --------------------------------------------------
+def normalize_timestamp(df, ts_col):
+    df = df.withColumn("_raw_ts", regexp_replace(trim(col(ts_col)), r"\s+", " "))
+
+    df = df.withColumn("_excel",
+        when(col("_raw_ts").rlike(r"^\d+(\.\d+)?$"),
+             expr("timestampadd(SECOND, cast((_raw_ts-25569)*86400 as int), timestamp('1970-01-01'))"))
+    )
+
+    formats = [
+        "dd-MM-yyyy HH:mm:ss","dd-MM-yyyy hh:mm:ss a",
+        "dd/MM/yyyy HH:mm:ss","MM/dd/yyyy HH:mm:ss",
+        "M/d/yy hh:mm a","M/d/yyyy hh:mm a"
+    ]
+
+    df = df.withColumn(
+        "_string_ts",
+        coalesce(*[to_timestamp(col("_raw_ts"), f) for f in formats])
+    )
+
+    return df.withColumn(
+        "event_ts",
+        coalesce(col("_excel"), col("_string_ts"))
+    ).drop("_raw_ts","_excel","_string_ts")
+
+# --------------------------------------------------
+# READERS (POSTLOGIN ONLY)
 # --------------------------------------------------
 def read_stacy(path):
     df = spark.read.option("header", True).csv(path)
-    user_col = "user_id" if "user_id" in df.columns else "customer_id"
-    return df.filter(col(user_col).isNotNull()) \
-             .select(col(user_col).alias("user_id")) \
+    df = normalize_timestamp(df, "HKT")
+    return df.filter(col("user_id").isNotNull()) \
+             .select(col("user_id"), col("event_ts")) \
              .withColumn("channel", lit("Stacy"))
 
 def read_chat(path):
     df = spark.read.option("header", True).csv(path)
-    return df.filter(col("Pre/Post") == "Postlogin") \
-             .filter(col("REL ID").isNotNull()) \
-             .select(col("REL ID").alias("user_id")) \
+    df = normalize_timestamp(df, "Timestamp")
+    return df.filter(col("Pre/Post")=="Postlogin") \
+             .select(col("REL ID").alias("user_id"), col("event_ts")) \
              .withColumn("channel", lit("Chat"))
 
 def read_call(path):
     df = spark.read.option("header", True).csv(path)
-    return df.filter(col("Verification Status") == "Pass") \
-             .filter(col("Customer No (CTI)").isNotNull()) \
-             .select(col("Customer No (CTI)").alias("user_id")) \
+    df = normalize_timestamp(df, "Call Start Time")
+    return df.filter(col("Verification Status")=="Pass") \
+             .select(col("Customer No (CTI)").alias("user_id"), col("event_ts")) \
              .withColumn("channel", lit("Call"))
 
 # --------------------------------------------------
 # LOAD DATA
 # --------------------------------------------------
 dfs = []
-for cnt in stacy_cnt:
-    for auth in stacy_auth:
-        p = f"/user/2030435/CallCentreAnalystics/{mnth}_stacy_{cnt}_{auth}login.csv"
-        df = read_stacy(p)
+
+for p, r in [
+    (f"/user/2030435/CallCentreAnalystics/{mnth}_stacy.csv", read_stacy),
+    (f"/user/2030435/CallCentreAnalystics/{mnth}_chat.csv", read_chat),
+    (f"/user/2030435/CallCentreAnalystics/{mnth}_call.csv", read_call)
+]:
+    df = safe_read(r, p)
+    if df is not None:
         dfs.append(df)
 
-dfs.append(read_chat(f"/user/2030435/CallCentreAnalystics/{mnth}_chat.csv"))
-dfs.append(read_call(f"/user/2030435/CallCentreAnalystics/{mnth}_call.csv"))
-
-combined_df = reduce(lambda a,b: a.unionByName(b), dfs).cache()
-
-# --------------------------------------------------
-# TOTALS
-# --------------------------------------------------
-total_postlogin_cases = combined_df.count()
-total_distinct_users = combined_df.select("user_id").distinct().count()
+combined_df = reduce(lambda a,b: a.unionByName(b), dfs) \
+                .filter(col("event_ts").isNotNull()) \
+                .cache()
 
 # --------------------------------------------------
-# USER CONTACT COUNTS
+# GLOBAL TOTALS
 # --------------------------------------------------
-user_contact_cnt = combined_df.groupBy("user_id") \
-                              .agg(count("*").alias("user_total_contacts"))
-df = combined_df.join(user_contact_cnt, "user_id")
+total_postlogin_contacts = combined_df.count()
 
 # --------------------------------------------------
-# FOLLOW-UP BUCKETS
+# ORDER INTERACTIONS PER USER
+# --------------------------------------------------
+w = Window.partitionBy("user_id").orderBy("event_ts")
+
+df = combined_df.withColumn("interaction_idx", row_number().over(w))
+
+# --------------------------------------------------
+# FOLLOW-UP BUCKET (INTERACTION LEVEL)
 # --------------------------------------------------
 df = df.withColumn(
     "follow_bucket",
-    when(col("user_total_contacts") == 1, "0")
-    .when(col("user_total_contacts") == 2, "1")
-    .when(col("user_total_contacts") == 3, "2")
+    when(col("interaction_idx")==1,"0")
+    .when(col("interaction_idx")==2,"1")
+    .when(col("interaction_idx")==3,"2")
     .otherwise("3+")
 )
 
 # --------------------------------------------------
-# STARTER CUSTOMERS (first contact per user)
+# SECOND / THIRD CHANNEL (INTERACTION LEVEL)
 # --------------------------------------------------
-w_user = Window.partitionBy("user_id").orderBy("channel")
-starter_df = df.withColumn("rn", row_number().over(w_user)) \
-               .filter(col("rn") == 1) \
-               .groupBy("channel") \
-               .agg(countDistinct("user_id").alias("starter_customers"))
+df = df.withColumn("second_channel",
+    when(col("interaction_idx")>=2, col("channel"))
+)
+
+df = df.withColumn("third_channel",
+    when(col("interaction_idx")>=3, col("channel"))
+)
 
 # --------------------------------------------------
-# TOTAL CASES PER CHANNEL
+# AGGREGATIONS
 # --------------------------------------------------
 total_case_df = df.groupBy("channel").agg(count("*").alias("total_case"))
 
-# --------------------------------------------------
-# FOLLOW-UP COUNTS
-# --------------------------------------------------
-bucket_df = df.groupBy("channel","follow_bucket").count() \
-              .groupBy("channel") \
-              .pivot("follow_bucket", ["0","1","2","3+"]).sum("count") \
-              .fillna(0) \
-              .withColumnRenamed("0","follow_up_0") \
-              .withColumnRenamed("1","follow_up_1") \
-              .withColumnRenamed("2","follow_up_2") \
-              .withColumnRenamed("3+","follow_up_3+")
+bucket_df = (
+    df.groupBy("channel","follow_bucket")
+      .count()
+      .groupBy("channel")
+      .pivot("follow_bucket",["0","1","2","3+"])
+      .sum("count")
+      .fillna(0)
+      .withColumnRenamed("0","follow_up_0")
+      .withColumnRenamed("1","follow_up_1")
+      .withColumnRenamed("2","follow_up_2")
+      .withColumnRenamed("3+","follow_up_3+")
+)
 
-# --------------------------------------------------
-# SECOND CHANNEL (users with follow_up 1+)
-# --------------------------------------------------
-df2 = df.filter(col("follow_bucket").isin(["1","2","3+"]))
-user_channels = df2.groupBy("user_id").agg(collect_set("channel").alias("channels_used"))
-df2 = df2.join(user_channels, "user_id").withColumn("other_channels", expr("filter(channels_used, x -> x != channel)"))
+sec_df = (
+    df.filter(col("interaction_idx")>=2)
+      .groupBy("channel","second_channel")
+      .count()
+      .groupBy("channel")
+      .pivot("second_channel",["Stacy","Chat","Call"])
+      .sum("count")
+      .fillna(0)
+      .selectExpr(
+          "channel",
+          "Stacy as sec_stacy",
+          "Chat as sec_chat",
+          "Call as sec_call"
+      )
+)
 
-second_df = df2.filter(size(col("other_channels")) >= 1) \
-               .withColumn("sec_channel", col("other_channels")[0]) \
-               .groupBy("channel","sec_channel").count()
-
-# --------------------------------------------------
-# THIRD CHANNEL (users with follow_up 2+)
-# --------------------------------------------------
-df3 = df.filter(col("follow_bucket").isin(["2","3+"]))
-user_channels3 = df3.groupBy("user_id").agg(collect_set("channel").alias("channels_used"))
-df3 = df3.join(user_channels3, "user_id").withColumn("other_channels", expr("filter(channels_used, x -> x != channel)"))
-
-third_df = df3.filter(size(col("other_channels")) >= 2) \
-               .withColumn("third_channel", col("other_channels")[1]) \
-               .groupBy("channel","third_channel").count()
-
-# --------------------------------------------------
-# PIVOT FUNCTION
-# --------------------------------------------------
-def pivot_rank(df, col_name, prefix):
-    w = Window.partitionBy("channel").orderBy(col("count").desc())
-    ranked = df.withColumn("r", row_number().over(w)).filter(col("r") <= 4)
-    exprs = []
-    for i in range(1,5):
-        exprs += [
-            max(when(col("r")==i, col(col_name))).alias(f"{prefix}_chnl_{i}"),
-            max(when(col("r")==i, col("count"))).alias(f"{prefix}_chnl_count_{i}")
-        ]
-    return ranked.groupBy("channel").agg(*exprs)
-
-sec_pivot = pivot_rank(second_df, "sec_channel", "sec")
-third_pivot = pivot_rank(third_df, "third_channel", "third")
+third_df = (
+    df.filter(col("interaction_idx")>=3)
+      .groupBy("channel","third_channel")
+      .count()
+      .groupBy("channel")
+      .pivot("third_channel",["Stacy","Chat","Call"])
+      .sum("count")
+      .fillna(0)
+      .selectExpr(
+          "channel",
+          "Stacy as third_stacy",
+          "Chat as third_chat",
+          "Call as third_call"
+      )
+)
 
 # --------------------------------------------------
 # FINAL ASSEMBLY
 # --------------------------------------------------
-final_df = total_case_df \
-    .join(bucket_df, "channel") \
-    .join(sec_pivot, "channel", "left") \
-    .join(third_pivot, "channel", "left") \
-    .join(starter_df, "channel", "left") \
-    .withColumn("Date", lit(part)) \
-    .withColumn("total_postlogin_cases", lit(total_postlogin_cases)) \
-    .withColumn("total_distinct_users", lit(total_distinct_users)) \
-    .withColumn("rep_rate", (col("follow_up_1")+col("follow_up_2")+col("follow_up_3+"))/col("total_case")) \
+final_df = (
+    total_case_df
+    .join(bucket_df,"channel")
+    .join(sec_df,"channel","left")
+    .join(third_df,"channel","left")
+    .withColumn("Date", lit(part))
+    .withColumn("total_postlogin_contacts", lit(total_postlogin_contacts))
     .withColumnRenamed("channel","Channel")
+)
 
-# --------------------------------------------------
-# FINAL COLUMN ORDER
-# --------------------------------------------------
-columns = [
-    "Date", "Channel",
-    "total_postlogin_cases","total_distinct_users",
-    "total_case","starter_customers","rep_rate",
-    "follow_up_0","follow_up_1","follow_up_2","follow_up_3+",
-    "sec_chnl_1","sec_chnl_2","sec_chnl_3","sec_chnl_4",
-    "sec_chnl_count_1","sec_chnl_count_2","sec_chnl_count_3","sec_chnl_count_4",
-    "third_chnl_1","third_chnl_2","third_chnl_3","third_chnl_4",
-    "third_chnl_count_1","third_chnl_count_2","third_chnl_count_3","third_chnl_count_4"
-]
-
-for c in columns:
-    if c not in final_df.columns:
-        final_df = final_df.withColumn(c, lit(None))
-
-final_df = final_df.select(columns)
-
-# --------------------------------------------------
-# SHOW RESULT
-# --------------------------------------------------
 final_df.show(truncate=False)
