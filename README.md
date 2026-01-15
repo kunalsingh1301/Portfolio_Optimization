@@ -1,18 +1,117 @@
-|202510|Chat   |333283               |133647              |464       |464              |0.8577586206896551|66         |110        |99         |189         |Stacy     |Call      |Chat      |null      |290             |56              |52              |null            |Stacy       |Call        |Chat        |null        |256               |19                |13                |null              |
-|202510|Call   |333283               |133647              |76158     |76158            |0.2808765986501746|54767      |10637      |3478       |7276        |Call      |Stacy     |Chat      |null      |21065           |311             |15              |null            |Call        |Stacy       |Chat        |null        |10584             |150               |20                |null              |
-|202510|Stacy  |333283               |133647              |57025     |57025            |0.6329679964927664|20930      |11291      |6934       |17870       |Stacy     |Call      |Chat      |null      |26954           |5113            |4028            |null            |Stacy       |Chat        |Call        |null        |16468             |4646              |3690              |null              |
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, sum as Fsum, expr, size, collect_list, when
+from functools import reduce
 
+spark = SparkSession.builder.appName("PostLoginFlow_InteractionLevel").getOrCreate()
 
+# ---------- Example combined_df schema ----------
+# user_id | channel | interaction_count | event_ts
 
+# --------------------------------------------------
+# TOTAL POSTLOGIN CASES
+# --------------------------------------------------
+total_postlogin_cases = combined_df.select(Fsum("interaction_count")).collect()[0][0]
+total_distinct_users = combined_df.select("user_id").distinct().count()
 
+# --------------------------------------------------
+# FOLLOW-UP BUCKET
+# --------------------------------------------------
+user_total = (
+    combined_df.groupBy("user_id", "channel")
+    .agg(Fsum("interaction_count").alias("total_interactions"))
+)
 
+user_total = user_total.withColumn(
+    "follow_bucket",
+    when(col("total_interactions") == 1, "0")
+    .when(col("total_interactions") == 2, "1")
+    .when(col("total_interactions") == 3, "2")
+    .otherwise("3+")
+)
 
+# Pivot to get follow_up_0,1,2,3+
+bucket_df = (
+    user_total.groupBy("channel")
+    .pivot("follow_bucket", ["0","1","2","3+"])
+    .agg(Fsum("total_interactions"))
+    .fillna(0)
+    .withColumnRenamed("0","follow_up_0")
+    .withColumnRenamed("1","follow_up_1")
+    .withColumnRenamed("2","follow_up_2")
+    .withColumnRenamed("3+","follow_up_3+")
+)
 
+# Total case per channel
+total_case_df = user_total.groupBy("channel").agg(Fsum("total_interactions").alias("total_case"))
 
+# --------------------------------------------------
+# SECOND / THIRD CHANNEL (SUM INTERACTIONS)
+# --------------------------------------------------
+# Collect all other channels per user
+user_channels = (
+    combined_df.groupBy("user_id")
+    .agg(collect_list("channel").alias("channels_used"),
+         Fsum("interaction_count").alias("interaction_sum"))
+)
 
+# Explode other channels for second and third
+from pyspark.sql.functions import array_except, element_at
 
-Date  	Channel	total_postlogin_cases	total_distinct_users	total_case	starter_customers	rep_rate          	follow_up_0	follow_up_1	follow_up_2	follow_up_3+	sec_chnl_1	sec_chnl_2	sec_chnl_3	sec_chnl_4	sec_chnl_count_1	sec_chnl_count_2	sec_chnl_count_3	sec_chnl_count_4	third_chnl_1	third_chnl_2	third_chnl_3	third_chnl_4	third_chnl_count_1	third_chnl_count_2	third_chnl_count_3	third_chnl_count_4
-202501	Chat   	276524	118032	27968	13721	0.997103833	81	2849	3282	21756	Stacy     	Call      	null      	null      	22112	5743	null            	null            	Stacy       	null        	null        	null        	5716	null              	null              	null              
-202501	Call   	276524	118032	135797	80080	0.630249564	50211	22351	12436	50799	Stacy     	Chat      	null      	null      	17689	37	null            	null            	Chat        	null        	null        	null        	5975	null              	null              	null              
-202501	Stacy  	276524	118032	112759	24231	0.842433863	17767	14680	11975	68337	Chat      	Call      	null      	null      	54301	24265	null            	null            	Chat        	null        	null        	null        	14502	null              	null              	null              
-![Uploading image.png…]()
+user_channels = user_channels.withColumn(
+    "second_channel",
+    element_at(array_except(col("channels_used"), array(col("channels_used")[0])), 1)
+).withColumn(
+    "third_channel",
+    element_at(array_except(col("channels_used"), array(col("channels_used")[0], col("second_channel"))), 1)
+)
+
+# Sum interactions by main channel -> second/third channel
+second_df = (
+    combined_df.join(user_channels, "user_id")
+    .groupBy("channel", "second_channel")
+    .agg(Fsum("interaction_count").alias("second_channel_sum"))
+)
+
+third_df = (
+    combined_df.join(user_channels, "user_id")
+    .groupBy("channel", "third_channel")
+    .agg(Fsum("interaction_count").alias("third_channel_sum"))
+)
+
+# Pivot top 4
+def pivot_top(df, col_name, sum_col, prefix):
+    from pyspark.sql.window import Window
+    from pyspark.sql.functions import row_number, max
+    
+    w = Window.partitionBy("channel").orderBy(col(sum_col).desc())
+    ranked = df.withColumn("r", row_number().over(w)).filter(col(sum_col).isNotNull())
+    
+    exprs = []
+    for i in range(1,5):
+        exprs += [
+            max(when(col("r") == i, col(col_name))).alias(f"{prefix}_chnl_{i}"),
+            max(when(col("r") == i, col(sum_col))).alias(f"{prefix}_chnl_count_{i}")
+        ]
+    return ranked.groupBy("channel").agg(*exprs)
+
+sec_pivot = pivot_top(second_df, "second_channel", "second_channel_sum", "sec")
+third_pivot = pivot_top(third_df, "third_channel", "third_channel_sum", "third")
+
+# --------------------------------------------------
+# FINAL ASSEMBLY
+# --------------------------------------------------
+final_df = (
+    total_case_df
+    .join(bucket_df, "channel")
+    .join(sec_pivot, "channel", "left")
+    .join(third_pivot, "channel", "left")
+    .withColumn("Date", lit("202510"))
+    .withColumn("total_postlogin_cases", lit(total_postlogin_cases))
+    .withColumn("total_distinct_users", lit(total_distinct_users))
+    .withColumn(
+        "rep_rate",
+        (col("follow_up_1") + col("follow_up_2") + col("follow_up_3+")) / col("total_case")
+    )
+)
+
+final_df.show(truncate=False)
