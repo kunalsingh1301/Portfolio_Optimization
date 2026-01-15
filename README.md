@@ -1,252 +1,186 @@
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import *
+from pyspark.sql.window import Window
 from functools import reduce
 
 # --------------------------------------------------
-# SPARK SESSION
+# SPARK
 # --------------------------------------------------
-spark = SparkSession.builder \
-    .appName("PostLoginFlow_NoTimestamp") \
-    .enableHiveSupport() \
-    .getOrCreate()
+spark = SparkSession.builder.appName("UnifiedPostloginAnalytics").getOrCreate()
 
 # --------------------------------------------------
-# CONFIG
+# MONTHS
 # --------------------------------------------------
-mnth = "jan"
-part = "202501"
-
-stacy_cnt = ["en", "zh"]
-stacy_auth = ["post"]
-post_login_values = ["OTP|S", "VB|S", "TPIN|S"]
+months = {
+    "202501": "jan", "202502": "feb", "202503": "mar",
+    "202504": "apr", "202505": "may", "202506": "jun"
+}
 
 # --------------------------------------------------
-# HDFS HELPERS
+# READ HELPERS
 # --------------------------------------------------
-hadoop_fs = spark._jvm.org.apache.hadoop.fs.FileSystem.get(
-    spark._jsc.hadoopConfiguration()
-)
-
-def path_exists(p):
-    return hadoop_fs.exists(
-        spark._jvm.org.apache.hadoop.fs.Path(p)
-    )
-
-def safe_read(func, path):
-    try:
-        if path_exists(path):
-            df = func(path)
-            if df is not None and not df.rdd.isEmpty():
-                return df
-    except Exception as e:
-        print(f"Error reading {path}: {e}")
-    return None
-
-# --------------------------------------------------
-# READERS (POSTLOGIN ONLY)
-# --------------------------------------------------
-def read_stacy(path):
-    df = spark.read.option("header", True).csv(path)
-    user_col = "user_id" if "user_id" in df.columns else "customer_id"
+def read_call(path, mnth):
     return (
-        df.filter(col(user_col).isNotNull())
-          .select(col(user_col).alias("user_id"))
-          .withColumn("channel", lit("Stacy"))
+        spark.read.option("header", True).csv(path)
+        .filter(col("Customer No (CTI)").isNotNull())
+        .select(
+            col("Customer No (CTI)").alias("user_id"),
+            lit("CALL").alias("channel")
+        )
     )
 
-def read_chat(path):
-    df = spark.read.option("header", True).csv(path)
+def read_chat(path, mnth):
     return (
-        df.filter(col("Pre/Post") == "Postlogin")
-          .filter(col("REL ID").isNotNull())
-          .select(col("REL ID").alias("user_id"))
-          .withColumn("channel", lit("Chat"))
+        spark.read.option("header", True).csv(path)
+        .filter(col("Pre/Post") == "Postlogin")
+        .select(
+            col("REL ID").alias("user_id"),
+            lit("CHAT").alias("channel")
+        )
     )
 
-def read_call(path):
-    df = spark.read.option("header", True).csv(path)
+def read_stacy(path, mnth):
     return (
-        df.filter(col("Verification Status") == "Pass")
-          .filter(col("Customer No (CTI)").isNotNull())
-          .select(col("Customer No (CTI)").alias("user_id"))
-          .withColumn("channel", lit("Call"))
-    )
-
-def read_ivr(path):
-    df = spark.read.option("header", True).csv(path)
-    return (
-        df.filter(col("ONE_FA").isin(post_login_values))
-          .filter(col("REL_ID").isNotNull())
-          .select(col("REL_ID").alias("user_id"))
-          .withColumn("channel", lit("IVR"))
+        spark.read.option("header", True).csv(path)
+        .filter(col("Login Status") == "Postlogin")
+        .select(
+            col("User ID").alias("user_id"),
+            lit("STACY").alias("channel")
+        )
     )
 
 # --------------------------------------------------
-# LOAD DATA
+# LOAD ALL DATA
 # --------------------------------------------------
 dfs = []
 
-for cnt in stacy_cnt:
-    for auth in stacy_auth:
-        p = f"/user/2030435/CallCentreAnalystics/{mnth}_stacy_{cnt}_{auth}login.csv"
-        df = safe_read(read_stacy, p)
-        if df is not None:
-            dfs.append(df)
+for part, mnth in months.items():
+    dfs.append(read_call(f"/user/data/{mnth}_call.csv", part))
+    dfs.append(read_chat(f"/user/data/{mnth}_chat.csv", part))
+    dfs.append(read_stacy(f"/user/data/{mnth}_stacy_en_post.csv", part))
+    dfs.append(read_stacy(f"/user/data/{mnth}_stacy_zh_post.csv", part))
 
-df = safe_read(read_chat, f"/user/2030435/CallCentreAnalystics/{mnth}_chat.csv")
-if df is not None:
-    dfs.append(df)
-
-df = safe_read(read_call, f"/user/2030435/CallCentreAnalystics/{mnth}_call.csv")
-if df is not None:
-    dfs.append(df)
-
-for i in range(1, 5):
-    p = f"/user/2030435/CallCentreAnalystics/{mnth}_ivr{i}.csv"
-    df = safe_read(read_ivr, p)
-    if df is not None:
-        dfs.append(df)
-
-if not dfs:
-    raise ValueError("No postlogin data found")
-
-combined_df = reduce(lambda a, b: a.unionByName(b), dfs).cache()
+df = reduce(lambda a, b: a.unionByName(b), dfs)
 
 # --------------------------------------------------
-# GLOBAL TOTALS
+# REMOVE IVR
 # --------------------------------------------------
-total_postlogin_cases = combined_df.count()
-total_distinct_users = combined_df.select("user_id").distinct().count()
+df = df.filter(col("channel") != "IVR")
 
 # --------------------------------------------------
-# CONTACT COUNT PER USER (MONTH)
+# ADD ROW ORDER (NO TIMESTAMP)
 # --------------------------------------------------
-user_contact_cnt = (
-    combined_df.groupBy("user_id")
-    .agg(count("*").alias("user_total_contacts"))
+df = df.withColumn("row_id", monotonically_increasing_id())
+
+# --------------------------------------------------
+# USER CONTACT COUNT
+# --------------------------------------------------
+user_cnt = (
+    df.groupBy("user_id")
+      .agg(count("*").alias("total_contacts"))
 )
 
-df = combined_df.join(user_contact_cnt, "user_id")
+df = df.join(user_cnt, "user_id")
 
 # --------------------------------------------------
-# FOLLOW-UP BUCKET (CASE LEVEL)
+# FOLLOW-UP BUCKET
 # --------------------------------------------------
 df = df.withColumn(
-    "follow_bucket",
-    when(col("user_total_contacts") == 1, "0")
-    .when(col("user_total_contacts") == 2, "1")
-    .when(col("user_total_contacts") == 3, "2")
-    .otherwise("3+")
+    "follow_up_bucket",
+    when(col("total_contacts") == 1, "follow_up_0")
+    .when(col("total_contacts") == 2, "follow_up_1")
+    .when(col("total_contacts") == 3, "follow_up_2")
+    .otherwise("follow_up_3+")
 )
 
 # --------------------------------------------------
-# TOTAL CASES PER CHANNEL
+# STARTER CHANNEL (NO TIME)
 # --------------------------------------------------
-total_case_df = (
-    df.groupBy("channel")
-      .agg(count("*").alias("total_case"))
+w = Window.partitionBy("user_id").orderBy("row_id")
+
+starter = (
+    df.withColumn("rn", row_number().over(w))
+      .filter(col("rn") == 1)
+      .select(
+          "user_id",
+          col("channel").alias("starter_channel")
+      )
 )
 
-# --------------------------------------------------
-# FOLLOW-UP COUNTS (CASE LEVEL)
-# --------------------------------------------------
-bucket_df = (
-    df.groupBy("channel", "follow_bucket")
-      .count()
-      .groupBy("channel")
-      .pivot("follow_bucket", ["0", "1", "2", "3+"])
-      .sum("count")
-      .fillna(0)
-      .withColumnRenamed("0", "follow_up_0")
-      .withColumnRenamed("1", "follow_up_1")
-      .withColumnRenamed("2", "follow_up_2")
-      .withColumnRenamed("3+", "follow_up_3+")
-)
+df = df.join(starter, "user_id", "left")
 
 # --------------------------------------------------
-# SECOND / THIRD CHANNEL (CASE LEVEL)
-# --------------------------------------------------
-user_channels = (
-    combined_df.groupBy("user_id")
-    .agg(collect_set("channel").alias("channels_used"))
-)
-
-df = df.join(user_channels, "user_id")
-
-df = df.withColumn(
-    "other_channels",
-    expr("filter(channels_used, x -> x != channel)")
-)
-
-second_df = (
-    df.filter(size(col("other_channels")) >= 1)
-      .withColumn("sec_channel", col("other_channels")[0])
-      .groupBy("channel", "sec_channel")
-      .count()
-)
-
-third_df = (
-    df.filter(size(col("other_channels")) >= 2)
-      .withColumn("third_channel", col("other_channels")[1])
-      .groupBy("channel", "third_channel")
-      .count()
-)
-
-def pivot_rank(df, col_name, prefix):
-    w = Window.partitionBy("channel").orderBy(col("count").desc())
-    ranked = df.withColumn("r", row_number().over(w)).filter(col("r") <= 4)
-
-    exprs = []
-    for i in range(1, 5):
-        exprs += [
-            max(when(col("r") == i, col(col_name))).alias(f"{prefix}_chnl_{i}"),
-            max(when(col("r") == i, col("count"))).alias(f"{prefix}_chnl_count_{i}")
-        ]
-
-    return ranked.groupBy("channel").agg(*exprs)
-
-sec_pivot = pivot_rank(second_df, "sec_channel", "sec")
-third_pivot = pivot_rank(third_df, "third_channel", "third")
-
-# --------------------------------------------------
-# FINAL ASSEMBLY
+# AGGREGATE PER CHANNEL
 # --------------------------------------------------
 final_df = (
-    total_case_df
-    .join(bucket_df, "channel")
-    .join(sec_pivot, "channel", "left")
-    .join(third_pivot, "channel", "left")
-    .withColumn("Date", lit(part))
-    .withColumn("total_postlogin_cases", lit(total_postlogin_cases))
-    .withColumn("total_distinct_users", lit(total_distinct_users))
+    df.groupBy("channel")
+      .agg(
+          count("*").alias("total_postlogin_cases"),
+          countDistinct("user_id").alias("total_distinct_users"),
+          sum(when(col("follow_up_bucket") == "follow_up_0", 1).otherwise(0)).alias("follow_up_0"),
+          sum(when(col("follow_up_bucket") == "follow_up_1", 1).otherwise(0)).alias("follow_up_1"),
+          sum(when(col("follow_up_bucket") == "follow_up_2", 1).otherwise(0)).alias("follow_up_2"),
+          sum(when(col("follow_up_bucket") == "follow_up_3+", 1).otherwise(0)).alias("follow_up_3+"),
+          sum(when(col("starter_channel") == col("channel"), 1).otherwise(0)).alias("starter_customers")
+      )
+)
+
+# --------------------------------------------------
+# DERIVED METRICS
+# --------------------------------------------------
+final_df = (
+    final_df
+    .withColumn("total_case", col("total_postlogin_cases"))
     .withColumn(
         "rep_rate",
         (col("follow_up_1") + col("follow_up_2") + col("follow_up_3+")) / col("total_case")
     )
-    .withColumnRenamed("channel", "Channel")
 )
 
 # --------------------------------------------------
-# FINAL COLUMN ORDER
+# SECOND & THIRD CHANNEL LOGIC
 # --------------------------------------------------
-columns = [
-    "Date", "Channel",
-    "total_postlogin_cases", "total_distinct_users",
-    "total_case", "rep_rate",
-    "follow_up_0", "follow_up_1", "follow_up_2", "follow_up_3+",
-    "sec_chnl_1", "sec_chnl_2", "sec_chnl_3", "sec_chnl_4",
-    "sec_chnl_count_1", "sec_chnl_count_2", "sec_chnl_count_3", "sec_chnl_count_4",
-    "third_chnl_1", "third_chnl_2", "third_chnl_3", "third_chnl_4",
-    "third_chnl_count_1", "third_chnl_count_2", "third_chnl_count_3", "third_chnl_count_4"
-]
-
-for c in columns:
-    if c not in final_df.columns:
-        final_df = final_df.withColumn(c, lit(None))
-
-final_df = final_df.select(columns)
+final_df = (
+    final_df
+    .withColumn("sec_chnl_count_1", col("follow_up_1"))
+    .withColumn("sec_chnl_count_2", col("follow_up_2"))
+    .withColumn("sec_chnl_count_3", col("follow_up_3+"))
+    .withColumn("sec_chnl_count_4", lit(0))
+    .withColumn(
+        "sec_chnl_1",
+        col("follow_up_1") + col("follow_up_2") + col("follow_up_3+")
+    )
+    .withColumn(
+        "third_chnl_1",
+        col("follow_up_2") + col("follow_up_3+")
+    )
+)
 
 # --------------------------------------------------
-# SHOW RESULT
+# FINAL FORMAT
 # --------------------------------------------------
-final_df.show(truncate=False)
+final_df = final_df.select(
+    lit("ALL").alias("Date"),
+    col("channel").alias("Channel"),
+    "total_postlogin_cases",
+    "total_distinct_users",
+    "total_case",
+    "starter_customers",
+    "rep_rate",
+    "follow_up_0",
+    "follow_up_1",
+    "follow_up_2",
+    col("follow_up_3+"),
+    "sec_chnl_1",
+    "sec_chnl_count_1",
+    "sec_chnl_count_2",
+    "sec_chnl_count_3",
+    "third_chnl_1"
+)
+
+# --------------------------------------------------
+# WRITE
+# --------------------------------------------------
+final_df.coalesce(6).write.mode("overwrite").option("header", True).csv(
+    "/user/output/Postlogin_Channel_Analytics"
+)
