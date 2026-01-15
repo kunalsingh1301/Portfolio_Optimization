@@ -2,7 +2,13 @@ from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
 # ============================================================
-# 1️⃣ CASE CONSTRUCTION (USER → MULTIPLE CASES)
+# GLOBAL TOTALS
+# ============================================================
+total_postlogin_cases = combined_df.count()
+total_distinct_users = combined_df.select("user_id").distinct().count()
+
+# ============================================================
+# 1️⃣ CASE CONSTRUCTION (CASE-LEVEL)
 # ============================================================
 w_user = Window.partitionBy("user_id").orderBy("event_ts")
 
@@ -21,7 +27,7 @@ df = df.withColumn(
 )
 
 # ============================================================
-# 2️⃣ CASE SIZE (ONE ROW = ONE CASE)
+# 2️⃣ CASE TABLE (1 ROW = 1 CASE)
 # ============================================================
 case_df = (
     df.groupBy("starter_channel", "user_id", "case_id")
@@ -29,7 +35,15 @@ case_df = (
 )
 
 # ============================================================
-# 3️⃣ FOLLOW-UP BUCKETS (CASE-LEVEL)
+# 3️⃣ STARTER CUSTOMERS (FIXED)
+# ============================================================
+starter_customer_df = (
+    case_df.groupBy("starter_channel")
+    .agg(F.countDistinct("user_id").alias("starter_customers"))
+)
+
+# ============================================================
+# 4️⃣ FOLLOW-UP BUCKETS (CASE-LEVEL)
 # ============================================================
 bucket_df = case_df.withColumn(
     "bucket",
@@ -41,7 +55,7 @@ bucket_df = case_df.withColumn(
 
 bucket_pivot = (
     bucket_df.groupBy("starter_channel", "bucket")
-    .count()                                  # ← number of CASES
+    .count()
     .groupBy("starter_channel")
     .pivot("bucket", ["0", "1", "2", "3+"])
     .sum("count")
@@ -53,7 +67,7 @@ bucket_pivot = (
 )
 
 # ============================================================
-# 4️⃣ TOTAL CASES (DERIVED, NOT RECOUNTED)
+# 5️⃣ TOTAL CASES (DERIVED, GUARANTEED MATCH)
 # ============================================================
 total_case_df = bucket_pivot.withColumn(
     "total_case",
@@ -63,8 +77,15 @@ total_case_df = bucket_pivot.withColumn(
   + F.col("follow_up_3+")
 )
 
+rep_rate_df = total_case_df.withColumn(
+    "rep_rate",
+    (F.col("follow_up_1") + F.col("follow_up_2") + F.col("follow_up_3+"))
+    / F.col("total_case")
+)
+
+
 # ============================================================
-# 5️⃣ SECOND CHANNEL (CASE-LEVEL, rn = 2)
+# 6️⃣ SECOND CHANNEL (CASE-LEVEL)
 # ============================================================
 sec_base = (
     df.filter(F.col("rn") == 2)
@@ -77,18 +98,12 @@ w2 = Window.partitionBy("starter_channel").orderBy(F.col("case_count").desc())
 sec_ranked = sec_base.withColumn("rank", F.row_number().over(w2)).filter("rank <= 4")
 
 sec_df = sec_ranked.groupBy("starter_channel").agg(
-    F.max(F.when(F.col("rank") == 1, F.col("channel"))).alias("sec_chnl_1"),
-    F.max(F.when(F.col("rank") == 2, F.col("channel"))).alias("sec_chnl_2"),
-    F.max(F.when(F.col("rank") == 3, F.col("channel"))).alias("sec_chnl_3"),
-    F.max(F.when(F.col("rank") == 4, F.col("channel"))).alias("sec_chnl_4"),
-    F.max(F.when(F.col("rank") == 1, F.col("case_count"))).alias("sec_chnl_count_1"),
-    F.max(F.when(F.col("rank") == 2, F.col("case_count"))).alias("sec_chnl_count_2"),
-    F.max(F.when(F.col("rank") == 3, F.col("case_count"))).alias("sec_chnl_count_3"),
-    F.max(F.when(F.col("rank") == 4, F.col("case_count"))).alias("sec_chnl_count_4")
+    *[F.max(F.when(F.col("rank") == i, F.col("channel"))).alias(f"sec_chnl_{i}") for i in range(1,5)],
+    *[F.max(F.when(F.col("rank") == i, F.col("case_count"))).alias(f"sec_chnl_count_{i}") for i in range(1,5)]
 )
 
 # ============================================================
-# 6️⃣ THIRD CHANNEL (CASE-LEVEL, rn = 3)
+# 7️⃣ THIRD CHANNEL (CASE-LEVEL)
 # ============================================================
 third_base = (
     df.filter(F.col("rn") == 3)
@@ -101,25 +116,34 @@ w3 = Window.partitionBy("starter_channel").orderBy(F.col("case_count").desc())
 third_ranked = third_base.withColumn("rank", F.row_number().over(w3)).filter("rank <= 4")
 
 third_df = third_ranked.groupBy("starter_channel").agg(
-    F.max(F.when(F.col("rank") == 1, F.col("channel"))).alias("third_chnl_1"),
-    F.max(F.when(F.col("rank") == 2, F.col("channel"))).alias("third_chnl_2"),
-    F.max(F.when(F.col("rank") == 3, F.col("channel"))).alias("third_chnl_3"),
-    F.max(F.when(F.col("rank") == 4, F.col("channel"))).alias("third_chnl_4"),
-    F.max(F.when(F.col("rank") == 1, F.col("case_count"))).alias("third_chnl_count_1"),
-    F.max(F.when(F.col("rank") == 2, F.col("case_count"))).alias("third_chnl_count_2"),
-    F.max(F.when(F.col("rank") == 3, F.col("case_count"))).alias("third_chnl_count_3"),
-    F.max(F.when(F.col("rank") == 4, F.col("case_count"))).alias("third_chnl_count_4")
+    *[F.max(F.when(F.col("rank") == i, F.col("channel"))).alias(f"third_chnl_{i}") for i in range(1,5)],
+    *[F.max(F.when(F.col("rank") == i, F.col("case_count"))).alias(f"third_chnl_count_{i}") for i in range(1,5)]
 )
 
 # ============================================================
-# 7️⃣ FINAL OUTPUT (FULLY RECONCILED)
+# 8️⃣ FINAL OUTPUT (ORDER EXACT AS REQUESTED)
 # ============================================================
 final_df = (
     total_case_df
+    .join(starter_customer_df, "starter_channel")
     .join(sec_df, "starter_channel", "left")
     .join(third_df, "starter_channel", "left")
     .withColumnRenamed("starter_channel", "Channel")
     .withColumn("Date", F.lit(part))
+    .withColumn("total_postlogin_cases", F.lit(total_postlogin_cases))
+    .withColumn("total_distinct_users", F.lit(total_distinct_users))
+    .withColumn("rep_rate", F.lit(None))  # kept for schema compatibility
 )
 
-final_df.show(truncate=False)
+columns = [
+    "Date", "Channel",
+    "total_postlogin_cases", "total_distinct_users",
+    "total_case", "starter_customers", "rep_rate",
+    "follow_up_0", "follow_up_1", "follow_up_2", "follow_up_3+",
+    "sec_chnl_1", "sec_chnl_2", "sec_chnl_3", "sec_chnl_4",
+    "sec_chnl_count_1", "sec_chnl_count_2", "sec_chnl_count_3", "sec_chnl_count_4",
+    "third_chnl_1", "third_chnl_2", "third_chnl_3", "third_chnl_4",
+    "third_chnl_count_1", "third_chnl_count_2", "third_chnl_count_3", "third_chnl_count_4"
+]
+
+final_df.select(columns).show(truncate=False)
