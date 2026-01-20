@@ -1,1 +1,43 @@
-AnalysisException: org.apache.hadoop.hive.ql.metadata.HiveException: MetaException(message:Failed to create external path hdfs://hkpscp001-haasbatch.hk.sc.net:8020/warehouse/tablespace/external/hive/prd_tbl_uocolab_grp_nsen.db for database prd_tbl_uocolab_grp_nsen. This may result in access not being allowed if the StorageBasedAuthorizationProvider is enabled: null) Traceback (most recent call last): File "/opt/cloudera/parcels/SPARK3-3.3.2.3.3.7191000.10-1-1.p0.66392475/lib/spark3/python/lib/pyspark.zip/pyspark/sql/session.py", line 1034:undefined, in sql return DataFrame(self._jsparkSession.sql(sqlQuery), self) File "/opt/cloudera/parcels/SPARK3-3.3.2.3.3.7191000.10-1-1.p0.66392475/lib/spark3/python/lib/py4j-0.10.9.5-src.zip/py4j/java_gateway.py", line 1322, in __call__ answer, self.gateway_client, self.target_id, self.name) File "/opt/cloudera/parcels/SPARK3-3.3.2.3.3.7191000.10-1-1.p0.66392475/lib/spark3/python/lib/pyspark.zip/pyspark/sql/utils.py", line 196, in deco raise converted from None pyspark.sql.utils.AnalysisException: org.apache.hadoop.hive.ql.metadata.HiveException: MetaException(message:Failed to create external path hdfs://hkpscp001-haasbatch.hk.sc.net:8020/warehouse/tablespace/external/hive/prd_tbl_uocolab_grp_nsen.db for database prd_tbl_uocolab_grp_nsen. This may result in access not being allowed if the StorageBasedAuthorizationProvider is enabled: null)
+spark.sql(f"USE {TARGET_DB}")
+
+# dynamic partitions
+spark.sql("SET hive.exec.dynamic.partition=true")
+spark.sql("SET hive.exec.dynamic.partition.mode=nonstrict")
+
+# OPTIONAL: if you rerun same month and want no duplicates, drop partition first (uncomment)
+"""
+ym_list = [r["yearmonth"] for r in call_df.select("yearmonth").distinct().collect()]
+for ym in ym_list:
+    spark.sql(f"ALTER TABLE {FULL_TABLE} DROP IF EXISTS PARTITION (yearmonth='{ym}')")
+"""
+
+if not spark.catalog.tableExists(FULL_TABLE):
+    # Create table (stored as parquet) under this DB (needs table-create permission)
+    (call_df
+        .repartition(col("yearmonth"))
+        .write
+        .format("parquet")
+        .mode("overwrite")
+        .partitionBy("yearmonth")
+        .saveAsTable(FULL_TABLE)
+    )
+    print("Created table:", FULL_TABLE)
+else:
+    # Append new partitions / rows
+    (call_df
+        .repartition(col("yearmonth"))
+        .write
+        .format("parquet")
+        .mode("append")
+        .insertInto(FULL_TABLE)
+    )
+    print("Appended to table:", FULL_TABLE)
+
+# Validate
+spark.sql(f"SHOW PARTITIONS {FULL_TABLE}").show(200, truncate=False)
+spark.sql(f"""
+  SELECT yearmonth, COUNT(*) rows_cnt
+  FROM {FULL_TABLE}
+  GROUP BY yearmonth
+  ORDER BY yearmonth
+""").show(200, truncate=False)
